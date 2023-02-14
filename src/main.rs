@@ -1,12 +1,14 @@
-use core::time;
 use std::{
+    cell::RefCell,
     f32::consts::PI,
     fs::File,
     io::{Read, Write},
+    sync::{Arc, Mutex},
     thread,
     time::Instant,
 };
 
+use crossbeam_channel::{bounded, Receiver, Sender};
 use miniquad::*;
 
 use image::io::Reader as ImageReader;
@@ -17,8 +19,10 @@ const MAX_PARTICLES: usize = 20000;
 const CIRCLE_SIDES: usize = 12;
 const WIDTH: i32 = 1200;
 const HEIGHT: i32 = 1200;
-const BIN_SIZE: f32 = 14.0;
+const BIN_SIZE: f32 = 10.0;
+const NB_THREAD: usize = 4;
 
+#[derive(Clone)]
 struct Bin {
     indexes: Vec<usize>,
 }
@@ -26,7 +30,7 @@ struct Bin {
 impl Bin {
     fn new() -> Self {
         Bin {
-            indexes: Vec::with_capacity(20),
+            indexes: Vec::with_capacity(50),
         }
     }
 }
@@ -35,21 +39,22 @@ struct Stage {
     pipeline: Pipeline,
     bindings: Bindings,
 
-    pos: Vec<Vec2>,
+    pos: Arc<Mutex<Vec<Vec2>>>,
     last_pos: Vec<Vec2>,
     acc: Vec<Vec2>,
-    radii: Vec<f32>,
+    radii: Arc<Vec<f32>>,
     colors: Vec<Vec3>,
-    bins: Vec<Bin>,
+    bins: Arc<RefCell<Vec<Bin>>>,
     bin_w: usize,
-    bin_order: Vec<(usize, usize)>,
     last_frame: Instant,
     mouse_pressed: bool,
     mouse_pos: Vec2,
+    start_collide_tx: Vec<Sender<()>>,
+    done_collide_rx: Receiver<()>,
 }
 
 impl Stage {
-    pub fn new(ctx: &mut Context) -> Stage {
+    pub fn new(ctx: &mut Context) -> Box<Stage> {
         quad_rand::srand(1);
 
         let mut vertices = vec![0f32; (CIRCLE_SIDES + 1) * 2];
@@ -106,11 +111,13 @@ impl Stage {
 
         let colors_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &colors);
 
-        let radii = (0..MAX_PARTICLES)
-            .map(|_| quad_rand::gen_range(4.0, 4.0))
-            .collect::<Vec<f32>>();
+        let radii = Arc::new(
+            (0..MAX_PARTICLES)
+                .map(|_| quad_rand::gen_range(2.0, 2.5))
+                .collect::<Vec<f32>>(),
+        );
 
-        let radii_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &radii);
+        let radii_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &*radii);
 
         let bindings = Bindings {
             vertex_buffers: vec![
@@ -154,114 +161,174 @@ impl Stage {
         let bin_w = (WIDTH as f32 / BIN_SIZE).ceil() as usize;
         let bin_h = (HEIGHT as f32 / BIN_SIZE).ceil() as usize;
 
-        let bins = (0..bin_w)
-            .flat_map(|_| (0..bin_h).map(|_| Bin::new()))
-            .collect();
+        let bins = Arc::new(RefCell::new(Vec::with_capacity(bin_w * bin_h)));
 
-        let mut bin_order = Vec::new();
-        for bin_i in 1..(bin_w - 1) {
-            for bin_j in 1..(bin_h - 1) {
-                for off_i in (-1i32)..2 {
-                    for off_j in (-1i32)..2 {
-                        bin_order.push((
-                            bin_i + bin_j * bin_w,
-                            (bin_i as i32 + off_i) as usize
-                                + (bin_j as i32 + off_j) as usize * bin_w,
-                        ));
-                    }
-                }
-            }
+        for _ in 0..(bin_w * bin_h) {
+            bins.borrow_mut().push(Bin::new());
         }
 
-        thread::spawn(|| loop {
-            //println!("hello");
-            thread::sleep(time::Duration::from_millis(500));
-        });
+        let pos = Arc::new(Mutex::new(Vec::with_capacity(MAX_PARTICLES)));
 
-        Stage {
+        let (start_collide_tx, start_collide_rx): (Vec<Sender<()>>, Vec<Receiver<()>>) =
+            (0..NB_THREAD).map(|_| bounded(1)).unzip();
+        let (done_collide_tx, done_collide_rx) = bounded(1);
+
+        let stage = Box::new(Stage {
             pipeline,
             bindings,
-            pos: Vec::with_capacity(MAX_PARTICLES),
+            pos: Arc::clone(&pos),
             last_pos: Vec::with_capacity(MAX_PARTICLES),
             acc: Vec::with_capacity(MAX_PARTICLES),
             colors,
-            radii,
-            bins,
+            radii: Arc::clone(&radii),
+            bins: Arc::clone(&bins),
             bin_w,
-            bin_order,
             last_frame: Instant::now(),
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
+            start_collide_tx,
+            done_collide_rx,
+        });
+
+        for (tid, slice) in bins
+            .borrow()
+            .chunks(bins.borrow().len() / NB_THREAD)
+            .enumerate()
+        {
+            let section_h = bin_h / NB_THREAD;
+            let srx = start_collide_rx[tid].clone();
+            let dtx = done_collide_tx.clone();
+
+            let pos = Arc::clone(&pos);
+            let rad = Arc::clone(&radii);
+
+            thread::spawn(move || loop {
+                srx.recv().unwrap();
+                for bin_j in 0..section_h {
+                    if bin_j < 1 || bin_j >= bin_h - 1 {
+                        continue;
+                    }
+                    for bin_i in 1..(bin_w - 1) {
+                        for off_i in (-1i32)..2 {
+                            for off_j in (-1i32)..2 {
+                                let bin1 = bin_i + bin_j * bin_w;
+                                let bin2 = (bin_i as i32 + off_i) as usize
+                                    + (bin_j as i32 + off_j) as usize * bin_w;
+
+                                for &i in slice[bin1].indexes.iter() {
+                                    for &j in slice[bin2].indexes.iter() {
+                                        if i >= j {
+                                            continue;
+                                        }
+                                        let mut p = pos.lock().unwrap();
+                                        let v = p[i] - p[j];
+                                        let dist2 = v.length_squared();
+                                        let min_dist = rad[i] + rad[j];
+                                        if dist2 < min_dist * min_dist {
+                                            let dist = dist2.sqrt();
+                                            let n = v / dist;
+                                            let mass_ratio_i = rad[i] / (rad[i] + rad[j]);
+                                            let mass_ratio_j = rad[j] / (rad[i] + rad[j]);
+                                            let delta = 0.5 * 0.75 * (dist - min_dist);
+                                            p[i] -= n * (mass_ratio_j * delta);
+                                            p[j] += n * (mass_ratio_i * delta);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                dtx.send(()).unwrap();
+            });
         }
+
+        return stage;
     }
 
     fn apply_gravity(&mut self) {
-        for i in 0..self.pos.len() {
+        for i in 0..self.acc.len() {
             self.acc[i] = self.acc[i] + vec2(10.0, 200.0);
         }
     }
 
     fn apply_constraint(&mut self) {
+        let mut p = self.pos.lock().unwrap();
         //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
-        for i in 0..self.pos.len() {
+        for i in 0..p.len() {
             /*let diff = center - self.pos[i];
             let len = diff.length();
             if len > 400.0 - self.radii[i] {
                 let n = diff / len;
                 self.pos[i] = center - n * (400.0 - self.radii[i]);
             }*/
-            let v = self.pos[i] - vec2(850.0, 600.0);
+            let v = p[i] - vec2(850.0, 600.0);
             let dist2 = v.length_squared();
             let min_dist = self.radii[i] + 100.0;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= n * 0.1 * (dist - min_dist);
+                p[i] -= n * 0.1 * (dist - min_dist);
             }
 
-            self.pos[i] = self.pos[i].clamp(
-                vec2(100.0 + self.radii[i], 100.0 + self.radii[i]),
-                vec2(
-                    WIDTH as f32 - 100.0 - self.radii[i],
-                    HEIGHT as f32 - 100.0 - self.radii[i],
-                ),
-            );
+            let factor = 0.75;
+
+            if p[i].x > WIDTH as f32 - 100.0 - self.radii[i] {
+                p[i].x += factor * (WIDTH as f32 - 100.0 - self.radii[i] - p[i].x);
+            }
+            if p[i].x < 100.0 + self.radii[i] {
+                p[i].x += factor * (100.0 + self.radii[i] - p[i].x);
+            }
+            if p[i].y > HEIGHT as f32 - 100.0 - self.radii[i] {
+                p[i].y += factor * (HEIGHT as f32 - 100.0 - self.radii[i] - p[i].y);
+            }
+            if p[i].y < 100.0 + self.radii[i] {
+                p[i].y += factor * (100.0 + self.radii[i] - p[i].y);
+            }
         }
     }
 
-    fn update_sub(&mut self, dt: f32) {
-        for i in 0..self.pos.len() {
-            let diff = self.pos[i] - self.last_pos[i];
-            self.last_pos[i] = self.pos[i];
-            self.pos[i] = self.pos[i] + diff + self.acc[i] * (dt * dt);
+    fn update_pos(&mut self, dt: f32) {
+        let mut p = self.pos.lock().unwrap();
+        for i in 0..p.len() {
+            let diff = p[i] - self.last_pos[i];
+            self.last_pos[i] = p[i];
+            p[i] += diff + self.acc[i] * (dt * dt);
             self.acc[i] = Vec2::ZERO;
         }
     }
 
     fn fill_bins(&mut self) {
-        self.bins.iter_mut().for_each(|b| b.indexes.clear());
+        self.bins
+            .borrow_mut()
+            .iter_mut()
+            .for_each(|b| b.indexes.clear());
 
-        for i in 0..self.pos.len() {
-            let pos = self.pos[i] / BIN_SIZE;
-            self.bins[pos.x as usize + pos.y as usize * self.bin_w]
+        let p = self.pos.lock().unwrap();
+
+        for i in 0..p.len() {
+            let pos = p[i] / BIN_SIZE;
+            self.bins.borrow_mut()[pos.x as usize + pos.y as usize * self.bin_w]
                 .indexes
                 .push(i);
         }
     }
 
     fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
-        for i in 0..self.pos.len() {
-            let v = self.pos[i] - pos;
+        let mut p = self.pos.lock().unwrap();
+        for i in 0..p.len() {
+            let v = p[i] - pos;
             let dist2 = v.length_squared();
             let min_dist = self.radii[i] + size;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= n * 0.1 * (dist - min_dist);
+                p[i] -= n * 0.1 * (dist - min_dist);
             }
         }
     }
 
+    /*
     fn check_collisions_bin(&mut self, bin1: usize, bin2: usize) {
         for &i in self.bins[bin1].indexes.iter() {
             for &j in self.bins[bin2].indexes.iter() {
@@ -276,23 +343,40 @@ impl Stage {
                     let n = v / dist;
                     let mass_ratio_i = self.radii[i] / (self.radii[i] + self.radii[j]);
                     let mass_ratio_j = self.radii[j] / (self.radii[i] + self.radii[j]);
-                    let delta = 0.5 * 1.1 * (dist - min_dist);
+                    let delta = 0.5 * 0.75 * (dist - min_dist);
                     self.pos[i] -= n * (mass_ratio_j * delta);
                     self.pos[j] += n * (mass_ratio_i * delta);
                 }
             }
         }
     }
+    */
 
     fn check_collisions(&mut self) {
-        self.bin_order
-            .clone()
-            .into_iter()
-            .for_each(|(bin1, bin2)| self.check_collisions_bin(bin1, bin2));
+        for i in 0..(NB_THREAD / 2) {
+            self.start_collide_tx[i * 2].send(()).unwrap();
+        }
+        for _ in 0..(NB_THREAD / 2) {
+            self.done_collide_rx.recv().unwrap();
+        }
+
+        for i in 0..(NB_THREAD / 2) {
+            self.start_collide_tx[i * 2 + 1].send(()).unwrap();
+        }
+        for _ in 0..(NB_THREAD / 2) {
+            self.done_collide_rx.recv().unwrap();
+        }
+
+        /*
+                self.bin_order
+                    .clone()
+                    .into_iter()
+                    .for_each(|(bin1, bin2)| self.check_collisions_bin(bin1, bin2));
+        */
     }
 
     fn add_object(&mut self, pos: Vec2, vel: Vec2) {
-        self.pos.push(pos);
+        self.pos.lock().unwrap().push(pos);
         self.last_pos.push(pos - vel);
         self.acc.push(Vec2::ZERO);
     }
@@ -316,17 +400,17 @@ impl EventHandler for Stage {
         for i in 0..8 {
             let off_y = i as f32 * 8.0;
             for j in 0..5 {
-                if self.pos.len() >= MAX_PARTICLES {
+                if self.acc.len() >= MAX_PARTICLES {
                     break;
                 }
-                self.add_object(vec2(200.0, 200.0 + off_y) + dir * 8.0 * j as f32, dir * 5.0);
+                self.add_object(vec2(200.0, 200.0 + off_y) + dir * 8.0 * j as f32, dir * 1.0);
             }
         }
 
         // update particle positions
         for _ in 0..8 {
             self.apply_gravity();
-            self.update_sub(dt / 8.0);
+            self.update_pos(dt / 8.0);
             self.apply_constraint();
             self.fill_bins();
             self.check_collisions();
@@ -359,11 +443,12 @@ impl EventHandler for Stage {
     fn key_down_event(&mut self, ctx: &mut Context, keycode: KeyCode, _: KeyMods, _: bool) {
         match keycode {
             KeyCode::C => {
-                for i in 0..self.pos.len() {
+                let p = self.pos.lock().unwrap();
+                for i in 0..p.len() {
                     self.colors[i] = vec3(
-                        self.pos[i].x / WIDTH as f32,
-                        (self.pos[i].y - 400.0) / HEIGHT as f32,
-                        (self.pos[i].x + self.pos[i].y) / 2000.0,
+                        p[i].x / WIDTH as f32,
+                        (p[i].y - 400.0) / HEIGHT as f32,
+                        (p[i].x + p[i].y) / 2000.0,
                     );
                 }
 
@@ -389,14 +474,15 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
-                for i in 0..self.pos.len() {
-                    self.colors[i] = match self.pos[i].y < 400.0 {
+                let p = self.pos.lock().unwrap();
+                for i in 0..p.len() {
+                    self.colors[i] = match p[i].y < 400.0 {
                         true => Vec3::ONE,
                         false => {
-                            let x = ((self.pos[i].x - 100.0) / (WIDTH - 200) as f32
-                                * img.width() as f32) as u32;
-                            let y = ((self.pos[i].y - 400.0) / (HEIGHT - 500) as f32
-                                * img.height() as f32) as u32;
+                            let x = ((p[i].x - 100.0) / (WIDTH - 200) as f32 * img.width() as f32)
+                                as u32;
+                            let y = ((p[i].y - 400.0) / (HEIGHT - 500) as f32 * img.height() as f32)
+                                as u32;
                             let pixel = img.get_pixel(x, y);
                             vec3(pixel[0], pixel[1], pixel[2])
                         }
@@ -413,7 +499,7 @@ impl EventHandler for Stage {
     }
 
     fn draw(&mut self, ctx: &mut Context) {
-        self.bindings.vertex_buffers[1].update(ctx, &self.pos[..]);
+        self.bindings.vertex_buffers[1].update(ctx, &self.pos.lock().unwrap()[..]);
 
         let proj = Mat4::orthographic_lh(0.0, WIDTH as f32, HEIGHT as f32, 0.0, 0.0, 1.0);
 
@@ -422,7 +508,7 @@ impl EventHandler for Stage {
         ctx.apply_pipeline(&self.pipeline);
         ctx.apply_bindings(&self.bindings);
         ctx.apply_uniforms(&shader::Uniforms { mvp: proj });
-        ctx.draw(0, (CIRCLE_SIDES * 3) as i32, self.pos.len() as i32);
+        ctx.draw(0, (CIRCLE_SIDES * 3) as i32, self.acc.len() as i32);
         ctx.end_render_pass();
 
         ctx.commit_frame();
@@ -437,7 +523,7 @@ fn main() {
             high_dpi: false,
             ..Default::default()
         },
-        |mut ctx| Box::new(Stage::new(&mut ctx)),
+        |mut ctx| Stage::new(&mut ctx),
     );
 }
 

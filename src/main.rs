@@ -1,5 +1,3 @@
-#![feature(ptr_internals)]
-use itertools::Itertools;
 use std::{
     f32::consts::PI,
     fs::File,
@@ -20,11 +18,10 @@ const HEIGHT: i32 = 1200;
 const BIN_SIZE: f32 = 10.0;
 const NB_THREAD: usize = 15;
 
-#[derive(Clone)]
 struct Bin {
     i: usize,
     j: usize,
-    indexes: Vec<usize>,
+    indexes: Vec<(usize, Vec2)>,
 }
 
 impl Bin {
@@ -35,12 +32,12 @@ impl Bin {
             indexes: Vec::with_capacity(50),
         }
     }
+}
 
-    fn neighboors(&self, w: usize) -> impl Iterator<Item = usize> + '_ {
-        ((self.i - 1)..=(self.i + 1))
-            .cartesian_product((self.j - 1)..=(self.j + 1))
-            .map(move |(i, j)| i + j * w)
-    }
+enum UpdateCommand {
+    OneFrame,
+    Continue,
+    Stop,
 }
 
 struct Stage {
@@ -60,6 +57,7 @@ struct Stage {
     frame_count: usize,
     mouse_pressed: bool,
     mouse_pos: Vec2,
+    can_update: UpdateCommand,
 }
 
 impl Stage {
@@ -169,7 +167,7 @@ impl Stage {
         let bin_h = (HEIGHT as f32 / BIN_SIZE).ceil() as usize;
 
         let bins = (0..(bin_w * bin_h))
-            .map(|i| Bin::new(i % bin_w, i / bin_w))
+            .map(|i| Bin::new(i / bin_w, i % bin_w))
             .collect();
 
         Stage {
@@ -188,6 +186,7 @@ impl Stage {
             frame_count: 0,
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
+            can_update: UpdateCommand::Stop,
         }
     }
 
@@ -249,7 +248,7 @@ impl Stage {
             let pos = self.pos[i] / BIN_SIZE;
             self.bins[pos.x as usize + pos.y as usize * self.bin_w]
                 .indexes
-                .push(i);
+                .push((i, self.pos[i]));
         }
     }
 
@@ -266,6 +265,7 @@ impl Stage {
         }
     }
 
+    /*
     fn check_collisions_bin(&self, tid: usize, writable_pos: &mut [Vec2]) {
         let section_w = self.bin_w / NB_THREAD;
 
@@ -297,31 +297,117 @@ impl Stage {
                 }
             }
         }
-    }
+    }*/
 
     fn check_collisions(&mut self) {
-        let section_w = self.bin_w / NB_THREAD;
-        let stage = &*self;
-        let mut pos_clone: Vec<Vec<Vec2>> = (0..NB_THREAD).map(|_| self.pos.clone()).collect();
+        let bin_w = self.bin_w;
+        let bin_h = self.bin_h;
+        let chunk_size = (bin_w * bin_h) / NB_THREAD;
+
+        let radii = &self.radii;
+        let pos = &self.pos;
+
+        let bins = &mut self.bins;
 
         crossbeam::scope(|scope| {
-            for (tid, pos) in pos_clone.iter_mut().enumerate().filter(|(i, _)| i % 2 == 0) {
-                scope.spawn(move |_| stage.check_collisions_bin(tid, pos));
+            for (start_ind, bins) in bins
+                .chunks_mut(chunk_size)
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 0)
+                .map(|(i, b)| (i * chunk_size, b))
+            {
+                scope.spawn(move |_| {
+                    let bin_ptr = bins.as_ptr();
+                    for bin1 in bins.iter_mut() {
+                        if bin1.i < 1 || bin1.i >= bin_w - 1 || bin1.j < 1 || bin1.j >= bin_h - 1 {
+                            continue;
+                        }
+
+                        for off_i in -1..=1 {
+                            for off_j in -1..=1 {
+                                let bin2ind = (bin1.j as isize + off_i)
+                                    + (bin1.i as isize + off_j) * bin_w as isize
+                                    - start_ind as isize;
+
+                                let bin2 = unsafe { &*bin_ptr.offset(bin2ind) };
+
+                                for (i, pos1) in bin1.indexes.iter_mut() {
+                                    for (j, _) in bin2.indexes.iter() {
+                                        if *i == *j {
+                                            continue;
+                                        }
+
+                                        let v = pos[*i] - pos[*j];
+                                        let dist2 = v.length_squared();
+                                        let min_dist = radii[*i] + radii[*j];
+                                        if dist2 < min_dist * min_dist {
+                                            let dist = dist2.sqrt();
+                                            let n = v / dist;
+                                            let mass_ratio_j = radii[*j] / (radii[*i] + radii[*j]);
+                                            let delta = 0.5 * 0.75 * (dist - min_dist);
+                                            *pos1 -= n * (mass_ratio_j * delta);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
         })
         .unwrap();
 
         crossbeam::scope(|scope| {
-            for (tid, pos) in pos_clone.iter_mut().enumerate().filter(|(i, _)| i % 2 == 1) {
-                scope.spawn(move |_| stage.check_collisions_bin(tid, pos));
+            for (start_ind, bins) in bins
+                .chunks_mut(chunk_size)
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(i, b)| (i * chunk_size, b))
+            {
+                scope.spawn(move |_| {
+                    let bin_ptr = bins.as_ptr();
+                    for bin1 in bins.iter_mut() {
+                        if bin1.i < 1 || bin1.i >= bin_w - 1 || bin1.j < 1 || bin1.j >= bin_h - 1 {
+                            continue;
+                        }
+
+                        for off_i in -1..=1 {
+                            for off_j in -1..=1 {
+                                let bin2ind = (bin1.j as isize + off_i)
+                                    + (bin1.i as isize + off_j) * bin_w as isize
+                                    - start_ind as isize;
+
+                                let bin2 = unsafe { &*bin_ptr.offset(bin2ind) };
+
+                                for (i, pos1) in bin1.indexes.iter_mut() {
+                                    for (j, _) in bin2.indexes.iter() {
+                                        if *i == *j {
+                                            continue;
+                                        }
+
+                                        let v = pos[*i] - pos[*j];
+                                        let dist2 = v.length_squared();
+                                        let min_dist = radii[*i] + radii[*j];
+                                        if dist2 < min_dist * min_dist {
+                                            let dist = dist2.sqrt();
+                                            let n = v / dist;
+                                            let mass_ratio_j = radii[*j] / (radii[*i] + radii[*j]);
+                                            let delta = 0.5 * 0.75 * (dist - min_dist);
+                                            *pos1 -= n * (mass_ratio_j * delta);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
             }
         })
         .unwrap();
 
         for bin in self.bins.iter() {
-            let good_pos = &pos_clone[bin.i / section_w];
-            for &i in bin.indexes.iter() {
-                self.pos[i] = good_pos[i];
+            for (i, p) in bin.indexes.iter() {
+                self.pos[*i] = *p;
             }
         }
     }
@@ -335,6 +421,11 @@ impl Stage {
 
 impl EventHandler for Stage {
     fn update(&mut self, _: &mut Context) {
+        match self.can_update {
+            UpdateCommand::Stop => return,
+            _ => (),
+        }
+
         let start = Instant::now();
         let dt = 1. / 60.;
 
@@ -373,6 +464,11 @@ impl EventHandler for Stage {
             );
         }
         self.last_frame = Instant::now();
+
+        match self.can_update {
+            UpdateCommand::OneFrame => self.can_update = UpdateCommand::Stop,
+            _ => (),
+        }
     }
 
     fn mouse_motion_event(&mut self, _ctx: &mut Context, x: f32, y: f32) {
@@ -396,6 +492,29 @@ impl EventHandler for Stage {
 
     fn key_down_event(&mut self, ctx: &mut Context, keycode: KeyCode, _: KeyMods, _: bool) {
         match keycode {
+            KeyCode::B => {
+                let cols = self
+                    .bins
+                    .iter()
+                    .map(|_| {
+                        vec3(
+                            quad_rand::gen_range(0.0, 1.0),
+                            quad_rand::gen_range(0.0, 1.0),
+                            quad_rand::gen_range(0.0, 1.0),
+                        )
+                    })
+                    .collect::<Vec<Vec3>>();
+
+                for (bi, bin) in self.bins.iter().enumerate() {
+                    for (i, _) in bin.indexes.iter() {
+                        self.colors[*i] = cols[bi];
+                    }
+                }
+
+                let colors_vertex_buffer =
+                    Buffer::immutable(ctx, BufferType::VertexBuffer, &self.colors);
+                self.bindings.vertex_buffers[2] = colors_vertex_buffer;
+            }
             KeyCode::C => {
                 for i in 0..self.len {
                     self.colors[i] = vec3(
@@ -421,8 +540,8 @@ impl EventHandler for Stage {
                     .collect::<Vec<Vec3>>();
 
                 for bin in self.bins.iter() {
-                    for &i in bin.indexes.iter() {
-                        self.colors[i] = cols[bin.i / (self.bin_w / NB_THREAD)];
+                    for (i, _) in bin.indexes.iter() {
+                        self.colors[*i] = cols[bin.i / (self.bin_h / NB_THREAD)];
                     }
                 }
 
@@ -438,7 +557,7 @@ impl EventHandler for Stage {
                     .flat_map(|c| c.to_array())
                     .map(|v| (v * 255.0).clamp(0.0, 255.0) as u8)
                     .collect::<Vec<u8>>();
-                file.write(&data).unwrap();
+                file.write_all(&data).unwrap();
                 println!("colors written to file");
             }
             KeyCode::I => {
@@ -466,6 +585,14 @@ impl EventHandler for Stage {
                 self.bindings.vertex_buffers[2] = colors_vertex_buffer;
 
                 println!("loaded image");
+            }
+            KeyCode::N => self.can_update = UpdateCommand::OneFrame,
+            KeyCode::Space => {
+                self.can_update = match self.can_update {
+                    UpdateCommand::OneFrame => UpdateCommand::Continue,
+                    UpdateCommand::Continue => UpdateCommand::Stop,
+                    UpdateCommand::Stop => UpdateCommand::Continue,
+                }
             }
             _ => (),
         }

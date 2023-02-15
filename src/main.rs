@@ -9,19 +9,19 @@ use miniquad::*;
 
 use image::io::Reader as ImageReader;
 
-use glam::{vec2, vec3, Mat4, Vec2, Vec3};
+use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
 
 const MAX_PARTICLES: usize = 40000;
 const CIRCLE_SIDES: usize = 12;
 const WIDTH: i32 = 1200;
 const HEIGHT: i32 = 1200;
 const BIN_SIZE: f32 = 10.0;
-const NB_THREAD: usize = 15;
+const NB_THREAD: usize = 20;
 
 struct Bin {
     i: usize,
     j: usize,
-    indexes: Vec<(usize, Vec2)>,
+    indexes: Vec<(usize, Vec3)>,
 }
 
 impl Bin {
@@ -45,10 +45,8 @@ struct Stage {
     bindings: Bindings,
 
     len: usize,
-    pos: Vec<Vec2>,
+    pos: Vec<Vec3>,
     last_pos: Vec<Vec2>,
-    acc: Vec<Vec2>,
-    radii: Vec<f32>,
     colors: Vec<Vec3>,
     bins: Vec<Bin>,
     bin_w: usize,
@@ -79,13 +77,6 @@ impl Stage {
             .collect::<Vec<u16>>();
 
         let index_buffer = Buffer::immutable(ctx, BufferType::IndexBuffer, &indices);
-
-        // empty, dynamic instance-data vertex buffer
-        let positions_vertex_buffer = Buffer::stream(
-            ctx,
-            BufferType::VertexBuffer,
-            MAX_PARTICLES * std::mem::size_of::<Vec2>(),
-        );
 
         let mut colors = vec![Vec3::ZERO; MAX_PARTICLES];
         let file = File::open("colors.txt");
@@ -118,18 +109,22 @@ impl Stage {
 
         let colors_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &colors);
 
-        let radii = (0..MAX_PARTICLES)
-            .map(|_| quad_rand::gen_range(2.0, 2.5))
-            .collect::<Vec<f32>>();
+        let pos = (0..MAX_PARTICLES)
+            .map(|_| vec3(0.0, 0.0, quad_rand::gen_range(2.0, 2.5)))
+            .collect::<Vec<Vec3>>();
 
-        let radii_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &radii);
+        // empty, dynamic instance-data vertex buffer
+        let positions_vertex_buffer = Buffer::stream(
+            ctx,
+            BufferType::VertexBuffer,
+            MAX_PARTICLES * std::mem::size_of::<Vec3>(),
+        );
 
         let bindings = Bindings {
             vertex_buffers: vec![
                 geometry_vertex_buffer,
                 positions_vertex_buffer,
                 colors_vertex_buffer,
-                radii_vertex_buffer,
             ],
             index_buffer,
             images: vec![],
@@ -149,16 +144,11 @@ impl Stage {
                     step_func: VertexStep::PerInstance,
                     ..Default::default()
                 },
-                BufferLayout {
-                    step_func: VertexStep::PerInstance,
-                    ..Default::default()
-                },
             ],
             &[
                 VertexAttribute::with_buffer("pos", VertexFormat::Float2, 0),
-                VertexAttribute::with_buffer("inst_pos", VertexFormat::Float2, 1),
+                VertexAttribute::with_buffer("pos_radius", VertexFormat::Float3, 1),
                 VertexAttribute::with_buffer("color0", VertexFormat::Float3, 2),
-                VertexAttribute::with_buffer("radius", VertexFormat::Float1, 3),
             ],
             shader,
         );
@@ -174,11 +164,9 @@ impl Stage {
             pipeline,
             bindings,
             len: 0,
-            pos: vec![Vec2::ZERO; MAX_PARTICLES],
+            pos,
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
-            acc: vec![Vec2::ZERO; MAX_PARTICLES],
             colors,
-            radii,
             bins,
             bin_w,
             bin_h,
@@ -187,12 +175,6 @@ impl Stage {
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
             can_update: UpdateCommand::Stop,
-        }
-    }
-
-    fn apply_gravity(&mut self) {
-        for i in 0..self.len {
-            self.acc[i] += vec2(10.0, 200.0);
         }
     }
 
@@ -206,38 +188,37 @@ impl Stage {
                 self.pos[i] = center - n * (400.0 - self.radii[i]);
             }*/
 
-            let v = self.pos[i] - vec2(850.0, 600.0);
+            let v = self.pos[i].xy() - vec2(850.0, 600.0);
             let dist2 = v.length_squared();
-            let min_dist = self.radii[i] + 100.0;
+            let min_dist = self.pos[i].z + 100.0;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= n * 0.1 * (dist - min_dist);
+                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
             }
 
             let factor = 0.75;
 
-            if self.pos[i].x > WIDTH as f32 - 100.0 - self.radii[i] {
-                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.radii[i] - self.pos[i].x);
+            if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
+                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
             }
-            if self.pos[i].x < 100.0 + self.radii[i] {
-                self.pos[i].x += factor * (100.0 + self.radii[i] - self.pos[i].x);
+            if self.pos[i].x < 100.0 + self.pos[i].z {
+                self.pos[i].x += factor * (100.0 + self.pos[i].z - self.pos[i].x);
             }
-            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.radii[i] {
-                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.radii[i] - self.pos[i].y);
+            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.pos[i].z {
+                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.pos[i].z - self.pos[i].y);
             }
-            if self.pos[i].y < 100.0 + self.radii[i] {
-                self.pos[i].y += factor * (100.0 + self.radii[i] - self.pos[i].y);
+            if self.pos[i].y < 100.0 + self.pos[i].z {
+                self.pos[i].y += factor * (100.0 + self.pos[i].z - self.pos[i].y);
             }
         }
     }
 
     fn update_pos(&mut self, dt: f32) {
         for i in 0..self.len {
-            let diff = self.pos[i] - self.last_pos[i];
-            self.last_pos[i] = self.pos[i];
-            self.pos[i] += diff + self.acc[i] * (dt * dt);
-            self.acc[i] = Vec2::ZERO;
+            let diff = self.pos[i].xy() - self.last_pos[i];
+            self.last_pos[i] = self.pos[i].xy();
+            self.pos[i] += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
         }
     }
 
@@ -254,13 +235,13 @@ impl Stage {
 
     fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
         for i in 0..self.len {
-            let v = self.pos[i] - pos;
+            let v = self.pos[i].xy() - pos;
             let dist2 = v.length_squared();
-            let min_dist = self.radii[i] + size;
+            let min_dist = self.pos[i].z + size;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= n * 0.1 * (dist - min_dist);
+                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
             }
         }
     }
@@ -304,7 +285,6 @@ impl Stage {
         let bin_h = self.bin_h;
         let chunk_size = (bin_w * bin_h) / NB_THREAD;
 
-        let radii = &self.radii;
         let pos = &self.pos;
 
         let bins = &mut self.bins;
@@ -337,15 +317,15 @@ impl Stage {
                                             continue;
                                         }
 
-                                        let v = pos[*i] - pos[*j];
+                                        let v = pos[*i].xy() - pos[*j].xy();
                                         let dist2 = v.length_squared();
-                                        let min_dist = radii[*i] + radii[*j];
+                                        let min_dist = pos[*i].z + pos[*j].z;
                                         if dist2 < min_dist * min_dist {
                                             let dist = dist2.sqrt();
                                             let n = v / dist;
-                                            let mass_ratio_j = radii[*j] / (radii[*i] + radii[*j]);
+                                            let mass_ratio_j = pos[*j].z / (pos[*i].z + pos[*j].z);
                                             let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            *pos1 -= n * (mass_ratio_j * delta);
+                                            *pos1 -= (n * (mass_ratio_j * delta)).extend(0.0);
                                         }
                                     }
                                 }
@@ -385,15 +365,15 @@ impl Stage {
                                             continue;
                                         }
 
-                                        let v = pos[*i] - pos[*j];
+                                        let v = pos[*i].xy() - pos[*j].xy();
                                         let dist2 = v.length_squared();
-                                        let min_dist = radii[*i] + radii[*j];
+                                        let min_dist = pos[*i].z + pos[*j].z;
                                         if dist2 < min_dist * min_dist {
                                             let dist = dist2.sqrt();
                                             let n = v / dist;
-                                            let mass_ratio_j = radii[*j] / (radii[*i] + radii[*j]);
+                                            let mass_ratio_j = pos[*j].z / (pos[*i].z + pos[*j].z);
                                             let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            *pos1 -= n * (mass_ratio_j * delta);
+                                            *pos1 -= (n * (mass_ratio_j * delta)).extend(0.0);
                                         }
                                     }
                                 }
@@ -413,7 +393,7 @@ impl Stage {
     }
 
     fn add_object(&mut self, pos: Vec2, vel: Vec2) {
-        self.pos[self.len] = pos;
+        self.pos[self.len] = pos.extend(self.pos[self.len].z);
         self.last_pos[self.len] = pos - vel;
         self.len += 1;
     }
@@ -443,7 +423,6 @@ impl EventHandler for Stage {
 
         // update particle positions
         for _ in 0..8 {
-            self.apply_gravity();
             self.update_pos(dt / 8.0);
             self.apply_constraint();
             self.fill_bins();
@@ -541,7 +520,7 @@ impl EventHandler for Stage {
 
                 for bin in self.bins.iter() {
                     for (i, _) in bin.indexes.iter() {
-                        self.colors[*i] = cols[bin.i / (self.bin_h / NB_THREAD)];
+                        self.colors[*i] = cols[bin.j / (self.bin_w / NB_THREAD)];
                     }
                 }
 
@@ -632,16 +611,15 @@ mod shader {
 
     pub const VERTEX: &str = r#"#version 100
     attribute vec2 pos;
-    attribute vec2 inst_pos;
+    attribute vec3 pos_radius;
     attribute vec3 color0;
-    attribute float radius;
 
     varying lowp vec4 color;
 
     uniform mat4 mvp;
 
     void main() {
-        vec4 pos = vec4(pos * radius + inst_pos, 0.0, 1.0);
+        vec4 pos = vec4(pos * pos_radius.z + pos_radius.xy, 0.0, 1.0);
         gl_Position = mvp * pos;
         color = vec4(color0, 1.0);
     }

@@ -35,12 +35,19 @@ impl Bin {
             indexes: Vec::with_capacity(50),
         }
     }
+
+    fn neighboors(&self, w: usize) -> impl Iterator<Item = usize> + '_ {
+        ((self.i - 1)..=(self.i + 1))
+            .cartesian_product((self.j - 1)..=(self.j + 1))
+            .map(move |(i, j)| i + j * w)
+    }
 }
 
 struct Stage {
     pipeline: Pipeline,
     bindings: Bindings,
 
+    len: usize,
     pos: Vec<Vec2>,
     last_pos: Vec<Vec2>,
     acc: Vec<Vec2>,
@@ -50,6 +57,7 @@ struct Stage {
     bin_w: usize,
     bin_h: usize,
     last_frame: Instant,
+    frame_count: usize,
     mouse_pressed: bool,
     mouse_pos: Vec2,
 }
@@ -100,8 +108,8 @@ impl Stage {
                     .collect();
             }
             _ => {
-                for i in 0..MAX_PARTICLES {
-                    colors[i] = vec3(
+                for col in colors.iter_mut() {
+                    *col = vec3(
                         quad_rand::gen_range(0.0, 1.0),
                         quad_rand::gen_range(0.0, 1.0),
                         quad_rand::gen_range(0.0, 1.0),
@@ -116,7 +124,7 @@ impl Stage {
             .map(|_| quad_rand::gen_range(2.0, 2.5))
             .collect::<Vec<f32>>();
 
-        let radii_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &*radii);
+        let radii_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &radii);
 
         let bindings = Bindings {
             vertex_buffers: vec![
@@ -164,40 +172,41 @@ impl Stage {
             .map(|i| Bin::new(i % bin_w, i / bin_w))
             .collect();
 
-        let stage = Stage {
+        Stage {
             pipeline,
             bindings,
-            pos: Vec::with_capacity(MAX_PARTICLES),
-            last_pos: Vec::with_capacity(MAX_PARTICLES),
-            acc: Vec::with_capacity(MAX_PARTICLES),
+            len: 0,
+            pos: vec![Vec2::ZERO; MAX_PARTICLES],
+            last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
+            acc: vec![Vec2::ZERO; MAX_PARTICLES],
             colors,
             radii,
             bins,
             bin_w,
             bin_h,
             last_frame: Instant::now(),
+            frame_count: 0,
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
-        };
-
-        return stage;
+        }
     }
 
     fn apply_gravity(&mut self) {
-        for i in 0..self.acc.len() {
-            self.acc[i] = self.acc[i] + vec2(10.0, 200.0);
+        for i in 0..self.len {
+            self.acc[i] += vec2(10.0, 200.0);
         }
     }
 
     fn apply_constraint(&mut self) {
         //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
-        for i in 0..self.pos.len() {
+        for i in 0..self.len {
             /*let diff = center - self.pos[i];
             let len = diff.length();
             if len > 400.0 - self.radii[i] {
                 let n = diff / len;
                 self.pos[i] = center - n * (400.0 - self.radii[i]);
             }*/
+
             let v = self.pos[i] - vec2(850.0, 600.0);
             let dist2 = v.length_squared();
             let min_dist = self.radii[i] + 100.0;
@@ -225,7 +234,7 @@ impl Stage {
     }
 
     fn update_pos(&mut self, dt: f32) {
-        for i in 0..self.pos.len() {
+        for i in 0..self.len {
             let diff = self.pos[i] - self.last_pos[i];
             self.last_pos[i] = self.pos[i];
             self.pos[i] += diff + self.acc[i] * (dt * dt);
@@ -236,7 +245,7 @@ impl Stage {
     fn fill_bins(&mut self) {
         self.bins.iter_mut().for_each(|b| b.indexes.clear());
 
-        for i in 0..self.pos.len() {
+        for i in 0..self.len {
             let pos = self.pos[i] / BIN_SIZE;
             self.bins[pos.x as usize + pos.y as usize * self.bin_w]
                 .indexes
@@ -245,7 +254,7 @@ impl Stage {
     }
 
     fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
-        for i in 0..self.pos.len() {
+        for i in 0..self.len {
             let v = self.pos[i] - pos;
             let dist2 = v.length_squared();
             let min_dist = self.radii[i] + size;
@@ -257,23 +266,34 @@ impl Stage {
         }
     }
 
-    fn check_collisions_bin(&mut self, bin1: usize, bin2: usize) {
-        for &i in self.bins[bin1].indexes.iter() {
-            for &j in self.bins[bin2].indexes.iter() {
-                if i >= j {
-                    continue;
-                }
-                let v = self.pos[i] - self.pos[j];
-                let dist2 = v.length_squared();
-                let min_dist = self.radii[i] + self.radii[j];
-                if dist2 < min_dist * min_dist {
-                    let dist = dist2.sqrt();
-                    let n = v / dist;
-                    let mass_ratio_i = self.radii[i] / (self.radii[i] + self.radii[j]);
-                    let mass_ratio_j = self.radii[j] / (self.radii[i] + self.radii[j]);
-                    let delta = 0.5 * 0.75 * (dist - min_dist);
-                    self.pos[i] -= n * (mass_ratio_j * delta);
-                    self.pos[j] += n * (mass_ratio_i * delta);
+    fn check_collisions_bin(&self, tid: usize, writable_pos: &mut [Vec2]) {
+        let section_w = self.bin_w / NB_THREAD;
+
+        for bin_i in (tid * section_w)..((tid + 1) * section_w) {
+            if bin_i < 1 || bin_i >= self.bin_w - 1 {
+                continue;
+            }
+            for bin_j in 1..(self.bin_h - 1) {
+                let bin1 = &self.bins[bin_i + bin_j * self.bin_w];
+                for bin2 in bin1.neighboors(self.bin_w) {
+                    for &i in bin1.indexes.iter() {
+                        for &j in self.bins[bin2].indexes.iter() {
+                            if i == j {
+                                continue;
+                            }
+
+                            let v = self.pos[i] - self.pos[j];
+                            let dist2 = v.length_squared();
+                            let min_dist = self.radii[i] + self.radii[j];
+                            if dist2 < min_dist * min_dist {
+                                let dist = dist2.sqrt();
+                                let n = v / dist;
+                                let mass_ratio_j = self.radii[j] / (self.radii[i] + self.radii[j]);
+                                let delta = 0.5 * 0.75 * (dist - min_dist);
+                                writable_pos[i] -= n * (mass_ratio_j * delta);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -281,90 +301,24 @@ impl Stage {
 
     fn check_collisions(&mut self) {
         let section_w = self.bin_w / NB_THREAD;
-        let bin_w = self.bin_w;
-        let bin_h = self.bin_h;
-
-        let radii = &self.radii;
-        let bins = &self.bins;
-        let pos_read = &self.pos;
-
+        let stage = &*self;
         let mut pos_clone: Vec<Vec<Vec2>> = (0..NB_THREAD).map(|_| self.pos.clone()).collect();
 
         crossbeam::scope(|scope| {
             for (tid, pos) in pos_clone.iter_mut().enumerate().filter(|(i, _)| i % 2 == 0) {
-                scope.spawn(move |_| {
-                    for bin_i in (tid * section_w)..((tid + 1) * section_w) {
-                        if bin_i < 1 || bin_i >= bin_w - 1 {
-                            continue;
-                        }
-                        for bin_j in 1..(bin_h - 1) {
-                            for (off_i, off_j) in (-1i32..2).cartesian_product(-1i32..2) {
-                                let bin2 = (bin_i as i32 + off_i) as usize
-                                    + (bin_j as i32 + off_j) as usize * bin_w;
-                                for &i in bins[bin_i + bin_j * bin_w].indexes.iter() {
-                                    for &j in bins[bin2].indexes.iter() {
-                                        if i == j {
-                                            continue;
-                                        }
-
-                                        let v = pos_read[i] - pos_read[j];
-                                        let dist2 = v.length_squared();
-                                        let min_dist = radii[i] + radii[j];
-                                        if dist2 < min_dist * min_dist {
-                                            let dist = dist2.sqrt();
-                                            let n = v / dist;
-                                            let mass_ratio_j = radii[j] / (radii[i] + radii[j]);
-                                            let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            pos[i] -= n * (mass_ratio_j * delta);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+                scope.spawn(move |_| stage.check_collisions_bin(tid, pos));
             }
         })
         .unwrap();
 
         crossbeam::scope(|scope| {
             for (tid, pos) in pos_clone.iter_mut().enumerate().filter(|(i, _)| i % 2 == 1) {
-                scope.spawn(move |_| {
-                    for bin_i in (tid * section_w)..((tid + 1) * section_w) {
-                        if bin_i < 1 || bin_i >= bin_w - 1 {
-                            continue;
-                        }
-                        for bin_j in 1..(bin_h - 1) {
-                            for (off_i, off_j) in (-1i32..2).cartesian_product(-1i32..2) {
-                                let bin2 = (bin_i as i32 + off_i) as usize
-                                    + (bin_j as i32 + off_j) as usize * bin_w;
-                                for &i in bins[bin_i + bin_j * bin_w].indexes.iter() {
-                                    for &j in bins[bin2].indexes.iter() {
-                                        if i == j {
-                                            continue;
-                                        }
-
-                                        let v = pos_read[i] - pos_read[j];
-                                        let dist2 = v.length_squared();
-                                        let min_dist = radii[i] + radii[j];
-                                        if dist2 < min_dist * min_dist {
-                                            let dist = dist2.sqrt();
-                                            let n = v / dist;
-                                            let mass_ratio_j = radii[j] / (radii[i] + radii[j]);
-                                            let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            pos[i] -= n * (mass_ratio_j * delta);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
+                scope.spawn(move |_| stage.check_collisions_bin(tid, pos));
             }
         })
         .unwrap();
 
-        for bin in bins {
+        for bin in self.bins.iter() {
             let good_pos = &pos_clone[bin.i / section_w];
             for &i in bin.indexes.iter() {
                 self.pos[i] = good_pos[i];
@@ -373,31 +327,23 @@ impl Stage {
     }
 
     fn add_object(&mut self, pos: Vec2, vel: Vec2) {
-        self.pos.push(pos);
-        self.last_pos.push(pos - vel);
-        self.acc.push(Vec2::ZERO);
+        self.pos[self.len] = pos;
+        self.last_pos[self.len] = pos - vel;
+        self.len += 1;
     }
 }
 
 impl EventHandler for Stage {
     fn update(&mut self, _: &mut Context) {
-        // let elapsed = self.last_frame.elapsed().as_micros();
-        // let dt = (elapsed as f32 / 1000000f32).min(0.02);
+        let start = Instant::now();
         let dt = 1. / 60.;
-
-        println!(
-            "{}, {}",
-            1000000 / self.last_frame.elapsed().as_micros(),
-            self.pos.len()
-        );
-        self.last_frame = Instant::now();
 
         // emit new particles
         let dir = vec2(2.0, 1.0).normalize();
         for i in 0..8 {
             let off_y = i as f32 * 8.0;
             for j in 0..5 {
-                if self.acc.len() >= MAX_PARTICLES {
+                if self.len >= MAX_PARTICLES {
                     break;
                 }
                 self.add_object(vec2(200.0, 200.0 + off_y) + dir * 8.0 * j as f32, dir * 5.0);
@@ -416,6 +362,17 @@ impl EventHandler for Stage {
         if self.mouse_pressed {
             self.avoid_obstacle(self.mouse_pos, 50.0);
         }
+
+        self.frame_count += 1;
+        if self.frame_count % 30 == 0 {
+            println!(
+                "objects: {}, fps: {}, time to update: {}",
+                self.len,
+                1000000 / self.last_frame.elapsed().as_micros(),
+                start.elapsed().as_micros()
+            );
+        }
+        self.last_frame = Instant::now();
     }
 
     fn mouse_motion_event(&mut self, _ctx: &mut Context, x: f32, y: f32) {
@@ -440,7 +397,7 @@ impl EventHandler for Stage {
     fn key_down_event(&mut self, ctx: &mut Context, keycode: KeyCode, _: KeyMods, _: bool) {
         match keycode {
             KeyCode::C => {
-                for i in 0..self.pos.len() {
+                for i in 0..self.len {
                     self.colors[i] = vec3(
                         self.pos[i].x / WIDTH as f32,
                         (self.pos[i].y - 400.0) / HEIGHT as f32,
@@ -465,7 +422,7 @@ impl EventHandler for Stage {
 
                 for bin in self.bins.iter() {
                     for &i in bin.indexes.iter() {
-                        self.colors[i] = cols[(bin.i / (self.bin_w / NB_THREAD)) as usize];
+                        self.colors[i] = cols[bin.i / (self.bin_w / NB_THREAD)];
                     }
                 }
 
@@ -491,7 +448,7 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
-                for i in 0..self.pos.len() {
+                for i in 0..self.len {
                     self.colors[i] = match self.pos[i].y < 400.0 {
                         true => Vec3::ONE,
                         false => {
@@ -524,7 +481,7 @@ impl EventHandler for Stage {
         ctx.apply_pipeline(&self.pipeline);
         ctx.apply_bindings(&self.bindings);
         ctx.apply_uniforms(&shader::Uniforms { mvp: proj });
-        ctx.draw(0, (CIRCLE_SIDES * 3) as i32, self.acc.len() as i32);
+        ctx.draw(0, (CIRCLE_SIDES * 3) as i32, self.len as i32);
         ctx.end_render_pass();
 
         ctx.commit_frame();
@@ -539,7 +496,7 @@ fn main() {
             high_dpi: false,
             ..Default::default()
         },
-        |mut ctx| Box::new(Stage::new(&mut ctx)),
+        |ctx| Box::new(Stage::new(ctx)),
     );
 }
 

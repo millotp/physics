@@ -1,11 +1,7 @@
-#![feature(slice_ptr_len)]
-#![feature(raw_slice_split)]
-
 use std::{
     f32::consts::PI,
     fs::File,
     io::{Read, Write},
-    marker::PhantomData,
     time::Instant,
 };
 
@@ -20,19 +16,15 @@ const CIRCLE_SIDES: usize = 12;
 const WIDTH: i32 = 1200;
 const HEIGHT: i32 = 1200;
 const BIN_SIZE: f32 = 10.0;
-const NB_THREAD: usize = 20;
+const NB_THREAD: usize = 1;
 
 struct Bin {
-    i: u16,
-    j: u16,
     indexes: Vec<usize>,
 }
 
 impl Bin {
-    fn new(i: u16, j: u16) -> Self {
+    fn new() -> Self {
         Bin {
-            i,
-            j,
             indexes: Vec::with_capacity(50),
         }
     }
@@ -178,9 +170,7 @@ impl Stage {
 
         let num_bin = bin_w * bin_h;
 
-        let bins = (0..num_bin)
-            .map(|i| Bin::new((i % bin_w) as u16, (i / bin_w) as u16))
-            .collect();
+        let bins = (0..num_bin).map(|_| Bin::new()).collect();
 
         Stage {
             pipeline,
@@ -189,7 +179,7 @@ impl Stage {
             pos,
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
             sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
-            bin_start: vec![0; num_bin],
+            bin_start: vec![0; num_bin + 1],
             colors,
             bins,
             bin_w,
@@ -252,7 +242,7 @@ impl Stage {
 
         for i in 0..self.len {
             let pos = self.pos[i].xy() / BIN_SIZE;
-            self.bins[pos.x as usize + pos.y as usize * self.bin_w]
+            self.bins[pos.y.floor() as usize + pos.x.floor() as usize * self.bin_h]
                 .indexes
                 .push(i);
         }
@@ -265,6 +255,7 @@ impl Stage {
             self.bin_start[bi] = current_ind;
             current_ind += bin.indexes.len();
         }
+        self.bin_start[self.num_bin] = self.len;
     }
 
     fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
@@ -296,43 +287,45 @@ impl Stage {
 
         /*
         crossbeam::scope(|scope| {
-            let ite = ChunksMutIndices::new(sorted_pos, &breakpoints_thread);
-            for (curr_bin_start, bins_chunk) in ite.enumerate().filter(|(i, _)| i % 2 == 0).map(|(i, b)| b) {
-                let current_bin =
-                scope.spawn(move |_| for (pos1, bin_pos) in bins_chunk {
 
-                });
-            }
+            scope.spawn(move |_| {});
         })
-        .unwrap();
-        */
+        .unwrap();*/
 
-        for break_i in 0..self.num_bin {
-            let bin_x = break_i % self.bin_w;
-            let bin_y = break_i / self.bin_w;
-            if bin_x < 1 || bin_x >= self.bin_w - 1 || bin_y < 1 || bin_y >= self.bin_h - 1 {
+        let slice_i = 0;
+
+        let offset = self.bin_start[slice_i * chunk_size];
+        let slice_end = self.bin_start[(slice_i + 1) * chunk_size];
+        let slice_pos = &mut self.sorted_pos[offset..slice_end];
+
+        let slice_x_start = slice_i * (self.bin_w / NB_THREAD);
+        let slice_x_end = (slice_i + 1) * (self.bin_w / NB_THREAD);
+
+        for break_i in (slice_i * chunk_size)..((slice_i + 1) * chunk_size) {
+            let bin_x = break_i / self.bin_h;
+            let bin_y = break_i % self.bin_h;
+            if bin_x < slice_x_start + 1
+                || bin_x >= slice_x_end - 1
+                || bin_y < 1
+                || bin_y >= self.bin_h - 1
+            {
                 continue;
             }
 
             for i1 in self.bin_start[break_i]..self.bin_start[break_i + 1] {
-                let (pos1, _) = self.sorted_pos[i1];
+                let (pos1, _) = slice_pos[i1 - offset];
 
                 for off_i in -1..=1 {
                     for off_j in -1..=1 {
-                        let bin2ind = (bin_x as i32 + off_i) as usize
-                            + (bin_y as i32 + off_j) as usize * self.bin_w;
+                        let bin2ind = (bin_y as i32 + off_j) as usize
+                            + (bin_x as i32 + off_i) as usize * self.bin_h;
 
-                        let end2 = if bin2ind >= self.num_bin - 1 {
-                            self.len
-                        } else {
-                            self.bin_start[bin2ind + 1]
-                        };
-
-                        for i2 in self.bin_start[bin2ind]..end2 {
+                        for i2 in self.bin_start[bin2ind]..self.bin_start[bin2ind + 1] {
                             if i1 == i2 {
                                 continue;
                             }
-                            let (pos2, _) = self.sorted_pos[i2];
+
+                            let (pos2, _) = slice_pos[i2 - offset];
                             let v = pos1.xy() - pos2.xy();
                             let dist2 = v.length_squared();
                             let min_dist = pos1.z + pos2.z;
@@ -341,7 +334,7 @@ impl Stage {
                                 let n = v / dist;
                                 let mass_ratio = pos2.z / (pos1.z + pos2.z);
                                 let delta = 0.5 * 0.75 * (dist - min_dist);
-                                self.sorted_pos[i1].0 -= (n * (mass_ratio * delta)).extend(0.0);
+                                slice_pos[i1 - offset].0 -= (n * (mass_ratio * delta)).extend(0.0);
                             }
                         }
                     }
@@ -484,9 +477,9 @@ impl EventHandler for Stage {
                     })
                     .collect::<Vec<Vec3>>();
 
-                for bin in self.bins.iter() {
+                for (bi, bin) in self.bins.iter().enumerate() {
                     for &i in bin.indexes.iter() {
-                        self.colors[i] = cols[bin.j as usize / (self.bin_w / NB_THREAD)];
+                        self.colors[i] = cols[(bi % self.bin_w) / (self.bin_w / NB_THREAD)];
                     }
                 }
 
@@ -611,47 +604,5 @@ mod shader {
     #[repr(C)]
     pub struct Uniforms {
         pub mvp: glam::Mat4,
-    }
-}
-
-struct ChunksMutIndices<'a, T: 'a> {
-    v: *mut [T],
-    breakpoints: &'a [usize],
-    curr_ind: usize,
-    _marker: PhantomData<&'a mut T>,
-}
-
-impl<'a, T: 'a> ChunksMutIndices<'a, T> {
-    #[inline]
-    fn new(slice: &'a mut [T], breakpoints: &'a [usize]) -> Self {
-        Self {
-            v: slice,
-            breakpoints,
-            curr_ind: 0,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<'a, T> Iterator for ChunksMutIndices<'a, T> {
-    type Item = &'a mut [T];
-
-    #[inline]
-    fn next(&mut self) -> Option<&'a mut [T]> {
-        if self.v.is_empty() || self.curr_ind >= self.breakpoints.len() {
-            None
-        } else {
-            let siz = if self.curr_ind < self.breakpoints.len() - 1 {
-                self.breakpoints[self.curr_ind + 1] - self.breakpoints[self.curr_ind]
-            } else {
-                self.v.len()
-            };
-            self.curr_ind += 1;
-            // SAFETY: The self.v contract ensures that any split_at_mut is valid.
-            let (head, tail) = unsafe { self.v.split_at_mut(siz) };
-            self.v = tail;
-            // SAFETY: Nothing else points to or will point to the contents of this slice.
-            Some(unsafe { &mut *head })
-        }
     }
 }

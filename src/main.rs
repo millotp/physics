@@ -1,7 +1,11 @@
+#![feature(slice_ptr_len)]
+#![feature(raw_slice_split)]
+
 use std::{
     f32::consts::PI,
     fs::File,
     io::{Read, Write},
+    marker::PhantomData,
     time::Instant,
 };
 
@@ -11,7 +15,7 @@ use image::io::Reader as ImageReader;
 
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
 
-const MAX_PARTICLES: usize = 40000;
+const MAX_PARTICLES: usize = 20000;
 const CIRCLE_SIDES: usize = 12;
 const WIDTH: i32 = 1200;
 const HEIGHT: i32 = 1200;
@@ -19,13 +23,13 @@ const BIN_SIZE: f32 = 10.0;
 const NB_THREAD: usize = 20;
 
 struct Bin {
-    i: usize,
-    j: usize,
-    indexes: Vec<(usize, Vec3)>,
+    i: u16,
+    j: u16,
+    indexes: Vec<usize>,
 }
 
 impl Bin {
-    fn new(i: usize, j: usize) -> Self {
+    fn new(i: u16, j: u16) -> Self {
         Bin {
             i,
             j,
@@ -47,6 +51,9 @@ struct Stage {
     len: usize,
     pos: Vec<Vec3>,
     last_pos: Vec<Vec2>,
+    sorted_pos: Vec<(Vec3, usize)>,
+    bin_start: Vec<usize>,
+    num_bin: usize,
     colors: Vec<Vec3>,
     bins: Vec<Bin>,
     bin_w: usize,
@@ -84,17 +91,30 @@ impl Stage {
             Ok(mut file) => {
                 let mut data: Vec<u8> = Vec::new();
                 file.read_to_end(&mut data).unwrap();
-                assert!(data.len() == 3 * MAX_PARTICLES);
-                colors = data
-                    .chunks(3)
-                    .map(|col| {
-                        vec3(
-                            col[0] as f32 / 255.0,
-                            col[1] as f32 / 255.0,
-                            col[2] as f32 / 255.0,
-                        )
-                    })
-                    .collect();
+                if data.len() == 3 * MAX_PARTICLES {
+                    colors = data
+                        .chunks(3)
+                        .map(|col| {
+                            vec3(
+                                col[0] as f32 / 255.0,
+                                col[1] as f32 / 255.0,
+                                col[2] as f32 / 255.0,
+                            )
+                        })
+                        .collect();
+                } else {
+                    println!(
+                        "colors.txt file is meant for {} particles, generating random colors",
+                        data.len() / 3
+                    );
+                    for col in colors.iter_mut() {
+                        *col = vec3(
+                            quad_rand::gen_range(0.0, 1.0),
+                            quad_rand::gen_range(0.0, 1.0),
+                            quad_rand::gen_range(0.0, 1.0),
+                        );
+                    }
+                }
             }
             _ => {
                 for col in colors.iter_mut() {
@@ -156,8 +176,10 @@ impl Stage {
         let bin_w = (WIDTH as f32 / BIN_SIZE).ceil() as usize;
         let bin_h = (HEIGHT as f32 / BIN_SIZE).ceil() as usize;
 
-        let bins = (0..(bin_w * bin_h))
-            .map(|i| Bin::new(i / bin_w, i % bin_w))
+        let num_bin = bin_w * bin_h;
+
+        let bins = (0..num_bin)
+            .map(|i| Bin::new((i % bin_w) as u16, (i / bin_w) as u16))
             .collect();
 
         Stage {
@@ -166,10 +188,13 @@ impl Stage {
             len: 0,
             pos,
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
+            sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
+            bin_start: vec![0; num_bin],
             colors,
             bins,
             bin_w,
             bin_h,
+            num_bin,
             last_frame: Instant::now(),
             frame_count: 0,
             mouse_pressed: false,
@@ -226,10 +251,19 @@ impl Stage {
         self.bins.iter_mut().for_each(|b| b.indexes.clear());
 
         for i in 0..self.len {
-            let pos = self.pos[i] / BIN_SIZE;
+            let pos = self.pos[i].xy() / BIN_SIZE;
             self.bins[pos.x as usize + pos.y as usize * self.bin_w]
                 .indexes
-                .push((i, self.pos[i]));
+                .push(i);
+        }
+
+        let mut current_ind = 0;
+        for (bi, bin) in self.bins.iter().enumerate() {
+            for (i, &pi) in bin.indexes.iter().enumerate() {
+                self.sorted_pos[current_ind + i] = (self.pos[pi], pi);
+            }
+            self.bin_start[bi] = current_ind;
+            current_ind += bin.indexes.len();
         }
     }
 
@@ -246,149 +280,77 @@ impl Stage {
         }
     }
 
-    /*
-    fn check_collisions_bin(&self, tid: usize, writable_pos: &mut [Vec2]) {
-        let section_w = self.bin_w / NB_THREAD;
+    fn check_collisions(&mut self) {
+        let bin_w = self.bin_w;
+        let bin_h = self.bin_h;
+        let chunk_size = self.num_bin / NB_THREAD;
 
-        for bin_i in (tid * section_w)..((tid + 1) * section_w) {
-            if bin_i < 1 || bin_i >= self.bin_w - 1 {
+        let pos = &self.pos;
+        let breakpoints = &self.bin_start;
+        let breakpoints_thread = self
+            .bin_start
+            .iter()
+            .step_by(chunk_size)
+            .map(|&i| i)
+            .collect::<Vec<usize>>();
+
+        /*
+        crossbeam::scope(|scope| {
+            let ite = ChunksMutIndices::new(sorted_pos, &breakpoints_thread);
+            for (curr_bin_start, bins_chunk) in ite.enumerate().filter(|(i, _)| i % 2 == 0).map(|(i, b)| b) {
+                let current_bin =
+                scope.spawn(move |_| for (pos1, bin_pos) in bins_chunk {
+
+                });
+            }
+        })
+        .unwrap();
+        */
+
+        for break_i in 0..self.num_bin {
+            let bin_x = break_i % self.bin_w;
+            let bin_y = break_i / self.bin_w;
+            if bin_x < 1 || bin_x >= self.bin_w - 1 || bin_y < 1 || bin_y >= self.bin_h - 1 {
                 continue;
             }
-            for bin_j in 1..(self.bin_h - 1) {
-                let bin1 = &self.bins[bin_i + bin_j * self.bin_w];
-                for bin2 in bin1.neighboors(self.bin_w) {
-                    for &i in bin1.indexes.iter() {
-                        for &j in self.bins[bin2].indexes.iter() {
-                            if i == j {
+
+            for i1 in self.bin_start[break_i]..self.bin_start[break_i + 1] {
+                let (pos1, _) = self.sorted_pos[i1];
+
+                for off_i in -1..=1 {
+                    for off_j in -1..=1 {
+                        let bin2ind = (bin_x as i32 + off_i) as usize
+                            + (bin_y as i32 + off_j) as usize * self.bin_w;
+
+                        let end2 = if bin2ind >= self.num_bin - 1 {
+                            self.len
+                        } else {
+                            self.bin_start[bin2ind + 1]
+                        };
+
+                        for i2 in self.bin_start[bin2ind]..end2 {
+                            if i1 == i2 {
                                 continue;
                             }
-
-                            let v = self.pos[i] - self.pos[j];
+                            let (pos2, _) = self.sorted_pos[i2];
+                            let v = pos1.xy() - pos2.xy();
                             let dist2 = v.length_squared();
-                            let min_dist = self.radii[i] + self.radii[j];
+                            let min_dist = pos1.z + pos2.z;
                             if dist2 < min_dist * min_dist {
                                 let dist = dist2.sqrt();
                                 let n = v / dist;
-                                let mass_ratio_j = self.radii[j] / (self.radii[i] + self.radii[j]);
+                                let mass_ratio = pos2.z / (pos1.z + pos2.z);
                                 let delta = 0.5 * 0.75 * (dist - min_dist);
-                                writable_pos[i] -= n * (mass_ratio_j * delta);
+                                self.sorted_pos[i1].0 -= (n * (mass_ratio * delta)).extend(0.0);
                             }
                         }
                     }
                 }
             }
         }
-    }*/
 
-    fn check_collisions(&mut self) {
-        let bin_w = self.bin_w;
-        let bin_h = self.bin_h;
-        let chunk_size = (bin_w * bin_h) / NB_THREAD;
-
-        let pos = &self.pos;
-
-        let bins = &mut self.bins;
-
-        crossbeam::scope(|scope| {
-            for (start_ind, bins) in bins
-                .chunks_mut(chunk_size)
-                .enumerate()
-                .filter(|(i, _)| i % 2 == 0)
-                .map(|(i, b)| (i * chunk_size, b))
-            {
-                scope.spawn(move |_| {
-                    let bin_ptr = bins.as_ptr();
-                    for bin1 in bins.iter_mut() {
-                        if bin1.i < 1 || bin1.i >= bin_w - 1 || bin1.j < 1 || bin1.j >= bin_h - 1 {
-                            continue;
-                        }
-
-                        for off_i in -1..=1 {
-                            for off_j in -1..=1 {
-                                let bin2ind = (bin1.j as isize + off_i)
-                                    + (bin1.i as isize + off_j) * bin_w as isize
-                                    - start_ind as isize;
-
-                                let bin2 = unsafe { &*bin_ptr.offset(bin2ind) };
-
-                                for (i, pos1) in bin1.indexes.iter_mut() {
-                                    for (j, _) in bin2.indexes.iter() {
-                                        if *i == *j {
-                                            continue;
-                                        }
-
-                                        let v = pos[*i].xy() - pos[*j].xy();
-                                        let dist2 = v.length_squared();
-                                        let min_dist = pos[*i].z + pos[*j].z;
-                                        if dist2 < min_dist * min_dist {
-                                            let dist = dist2.sqrt();
-                                            let n = v / dist;
-                                            let mass_ratio_j = pos[*j].z / (pos[*i].z + pos[*j].z);
-                                            let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            *pos1 -= (n * (mass_ratio_j * delta)).extend(0.0);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        })
-        .unwrap();
-
-        crossbeam::scope(|scope| {
-            for (start_ind, bins) in bins
-                .chunks_mut(chunk_size)
-                .enumerate()
-                .filter(|(i, _)| i % 2 == 1)
-                .map(|(i, b)| (i * chunk_size, b))
-            {
-                scope.spawn(move |_| {
-                    let bin_ptr = bins.as_ptr();
-                    for bin1 in bins.iter_mut() {
-                        if bin1.i < 1 || bin1.i >= bin_w - 1 || bin1.j < 1 || bin1.j >= bin_h - 1 {
-                            continue;
-                        }
-
-                        for off_i in -1..=1 {
-                            for off_j in -1..=1 {
-                                let bin2ind = (bin1.j as isize + off_i)
-                                    + (bin1.i as isize + off_j) * bin_w as isize
-                                    - start_ind as isize;
-
-                                let bin2 = unsafe { &*bin_ptr.offset(bin2ind) };
-
-                                for (i, pos1) in bin1.indexes.iter_mut() {
-                                    for (j, _) in bin2.indexes.iter() {
-                                        if *i == *j {
-                                            continue;
-                                        }
-
-                                        let v = pos[*i].xy() - pos[*j].xy();
-                                        let dist2 = v.length_squared();
-                                        let min_dist = pos[*i].z + pos[*j].z;
-                                        if dist2 < min_dist * min_dist {
-                                            let dist = dist2.sqrt();
-                                            let n = v / dist;
-                                            let mass_ratio_j = pos[*j].z / (pos[*i].z + pos[*j].z);
-                                            let delta = 0.5 * 0.75 * (dist - min_dist);
-                                            *pos1 -= (n * (mass_ratio_j * delta)).extend(0.0);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                });
-            }
-        })
-        .unwrap();
-
-        for bin in self.bins.iter() {
-            for (i, p) in bin.indexes.iter() {
-                self.pos[*i] = *p;
-            }
+        for i in 0..self.len {
+            self.pos[self.sorted_pos[i].1] = self.sorted_pos[i].0;
         }
     }
 
@@ -411,13 +373,17 @@ impl EventHandler for Stage {
 
         // emit new particles
         let dir = vec2(2.0, 1.0).normalize();
+        let space = 8.0;
         for i in 0..8 {
-            let off_y = i as f32 * 8.0;
+            let off_y = i as f32 * space;
             for j in 0..5 {
                 if self.len >= MAX_PARTICLES {
                     break;
                 }
-                self.add_object(vec2(200.0, 200.0 + off_y) + dir * 8.0 * j as f32, dir * 5.0);
+                self.add_object(
+                    vec2(200.0, 200.0 + off_y) + dir * space * j as f32,
+                    dir * 5.0,
+                );
             }
         }
 
@@ -485,8 +451,8 @@ impl EventHandler for Stage {
                     .collect::<Vec<Vec3>>();
 
                 for (bi, bin) in self.bins.iter().enumerate() {
-                    for (i, _) in bin.indexes.iter() {
-                        self.colors[*i] = cols[bi];
+                    for &i in bin.indexes.iter() {
+                        self.colors[i] = cols[bi];
                     }
                 }
 
@@ -519,8 +485,8 @@ impl EventHandler for Stage {
                     .collect::<Vec<Vec3>>();
 
                 for bin in self.bins.iter() {
-                    for (i, _) in bin.indexes.iter() {
-                        self.colors[*i] = cols[bin.j / (self.bin_w / NB_THREAD)];
+                    for &i in bin.indexes.iter() {
+                        self.colors[i] = cols[bin.j as usize / (self.bin_w / NB_THREAD)];
                     }
                 }
 
@@ -645,5 +611,47 @@ mod shader {
     #[repr(C)]
     pub struct Uniforms {
         pub mvp: glam::Mat4,
+    }
+}
+
+struct ChunksMutIndices<'a, T: 'a> {
+    v: *mut [T],
+    breakpoints: &'a [usize],
+    curr_ind: usize,
+    _marker: PhantomData<&'a mut T>,
+}
+
+impl<'a, T: 'a> ChunksMutIndices<'a, T> {
+    #[inline]
+    fn new(slice: &'a mut [T], breakpoints: &'a [usize]) -> Self {
+        Self {
+            v: slice,
+            breakpoints,
+            curr_ind: 0,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'a, T> Iterator for ChunksMutIndices<'a, T> {
+    type Item = &'a mut [T];
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a mut [T]> {
+        if self.v.is_empty() || self.curr_ind >= self.breakpoints.len() {
+            None
+        } else {
+            let siz = if self.curr_ind < self.breakpoints.len() - 1 {
+                self.breakpoints[self.curr_ind + 1] - self.breakpoints[self.curr_ind]
+            } else {
+                self.v.len()
+            };
+            self.curr_ind += 1;
+            // SAFETY: The self.v contract ensures that any split_at_mut is valid.
+            let (head, tail) = unsafe { self.v.split_at_mut(siz) };
+            self.v = tail;
+            // SAFETY: Nothing else points to or will point to the contents of this slice.
+            Some(unsafe { &mut *head })
+        }
     }
 }

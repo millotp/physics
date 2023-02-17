@@ -135,7 +135,7 @@ impl Physics {
             .iter()
             .take(NUM_BIN)
             .step_by(chunk_size)
-            .map(|&i| i)
+            .copied()
             .collect::<Vec<usize>>();
 
         let check_slice = |slice_pos: &mut [(Vec3, usize)],
@@ -143,7 +143,7 @@ impl Physics {
                            start_x: usize,
                            width: usize,
                            wall: usize| {
-            if slice_pos.len() == 0 {
+            if slice_pos.is_empty() {
                 return;
             }
             for break_i in (start_x * BIN_H)..((start_x + width) * BIN_H) {
@@ -218,7 +218,7 @@ impl Physics {
             .skip(chunk_size / 2)
             .take(NUM_BIN - chunk_size)
             .step_by(chunk_size)
-            .map(|&i| i)
+            .copied()
             .collect::<Vec<usize>>();
 
         // check collisions across thread borders
@@ -263,10 +263,6 @@ impl Physics {
         self.len += 1;
     }
 
-    pub fn nb_particles(&self) -> usize {
-        return self.len;
-    }
-
     pub fn emit_flow(&mut self) {
         let dir = vec2(2.0, 1.0).normalize();
         let space = MAX_RADIUS * 2.0 + 0.01;
@@ -278,17 +274,21 @@ impl Physics {
                 }
                 self.add_object(
                     vec2(200.0, 200.0 + off_y) + dir * space * j as f32,
-                    dir * 2.2 as f32,
+                    dir * 2.2f32,
                 );
             }
         }
     }
 
+    pub fn nb_particles(&self) -> usize {
+        self.len
+    }
+
     pub fn get_bins(&self) -> &[Bin] {
-        return &self.bins;
+        &self.bins
     }
 
     pub fn get_points(&self) -> &[Vec3] {
-        return &self.pos;
+        &self.pos
     }
 }

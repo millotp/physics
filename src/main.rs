@@ -162,9 +162,8 @@ impl Stage {
 
 impl EventHandler for Stage {
     fn update(&mut self, _: &mut Context) {
-        match self.can_update {
-            UpdateCommand::Stop => return,
-            _ => (),
+        if let UpdateCommand::Stop = self.can_update {
+            return;
         }
 
         let start = Instant::now();
@@ -192,9 +191,8 @@ impl EventHandler for Stage {
         }
         self.last_frame = Instant::now();
 
-        match self.can_update {
-            UpdateCommand::OneFrame => self.can_update = UpdateCommand::Stop,
-            _ => (),
+        if let UpdateCommand::OneFrame = self.can_update {
+            self.can_update = UpdateCommand::Stop;
         }
     }
 
@@ -230,7 +228,7 @@ impl EventHandler for Stage {
             KeyCode::B => {
                 quad_rand::srand(2);
                 let palette = (0..self.physics.get_bins().len())
-                    .map(|i| random_color())
+                    .map(|_| random_color())
                     .collect::<Vec<Vec3>>();
 
                 for (bi, bin) in self.physics.get_bins().iter().enumerate() {
@@ -246,7 +244,7 @@ impl EventHandler for Stage {
             KeyCode::T => {
                 quad_rand::srand(3);
                 let palette = (0..NB_THREAD)
-                    .map(|i| random_color())
+                    .map(|_| random_color())
                     .collect::<Vec<Vec3>>();
 
                 for (bi, bin) in self.physics.get_bins().iter().enumerate() {
@@ -277,15 +275,19 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
-                let points = self.physics.get_points();
-
-                for i in 0..self.physics.nb_particles() {
-                    self.colors[i] = match points[i].y < 400.0 {
+                for (i, point) in self
+                    .physics
+                    .get_points()
+                    .iter()
+                    .enumerate()
+                    .take(self.physics.nb_particles())
+                {
+                    self.colors[i] = match point.y < 400.0 {
                         true => Vec3::ONE,
                         false => {
-                            let x = ((points[i].x - 100.0) / (WIDTH - 200) as f32
-                                * img.width() as f32) as u32;
-                            let y = ((points[i].y - 400.0) / (HEIGHT - 500) as f32
+                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32 * img.width() as f32)
+                                as u32;
+                            let y = ((point.y - 400.0) / (HEIGHT - 500) as f32
                                 * img.height() as f32) as u32;
                             let pixel = img.get_pixel(x, y);
                             vec3(pixel[0], pixel[1], pixel[2])
@@ -311,7 +313,7 @@ impl EventHandler for Stage {
     }
 
     fn draw(&mut self, ctx: &mut Context) {
-        self.bindings.vertex_buffers[1].update(ctx, &self.physics.get_points());
+        self.bindings.vertex_buffers[1].update(ctx, self.physics.get_points());
 
         let proj = Mat4::orthographic_lh(0.0, WIDTH as f32, HEIGHT as f32, 0.0, 0.0, 1.0);
 

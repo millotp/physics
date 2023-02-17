@@ -428,6 +428,7 @@ dependencies = [
  "image",
  "miniquad",
  "quad-rand",
+ "rayon",
 ]
 
 [[package]]

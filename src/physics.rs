@@ -1,0 +1,294 @@
+use glam::{vec2, vec3, Vec2, Vec3, Vec3Swizzles};
+use scoped_threadpool::Pool;
+
+use crate::{chunk_iter::ChunksMutIndices, HEIGHT, WIDTH};
+
+pub const MAX_PARTICLES: usize = 50000;
+const MAX_RADIUS: f32 = 2.5;
+pub const NB_THREAD: usize = 24;
+const BIN_SIZE: usize = 5;
+pub const BIN_W: usize = WIDTH / BIN_SIZE;
+const BIN_H: usize = HEIGHT / BIN_SIZE;
+const NUM_BIN: usize = BIN_W * BIN_H;
+
+const _: () = assert!((WIDTH / BIN_SIZE) % NB_THREAD == 0);
+const _: () = assert!(MAX_RADIUS * 2.0 <= BIN_SIZE as f32);
+
+pub struct Bin {
+    pub indexes: Vec<usize>,
+}
+
+impl Bin {
+    fn new() -> Self {
+        Bin {
+            indexes: Vec::with_capacity(10),
+        }
+    }
+}
+
+pub struct Physics {
+    len: usize,
+    pos: Vec<Vec3>,
+    last_pos: Vec<Vec2>,
+    sorted_pos: Vec<(Vec3, usize)>,
+    bins: Vec<Bin>,
+    bin_start: Vec<usize>,
+    pool: Pool,
+}
+
+impl Physics {
+    pub fn new() -> Physics {
+        let pos = (0..MAX_PARTICLES)
+            .map(|_| {
+                vec3(
+                    0.0,
+                    0.0,
+                    quad_rand::gen_range(MAX_RADIUS * 0.5, MAX_RADIUS * 0.6),
+                )
+            })
+            .collect::<Vec<Vec3>>();
+
+        let bins = (0..NUM_BIN).map(|_| Bin::new()).collect();
+
+        Physics {
+            len: 0,
+            pos,
+            last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
+            sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
+            bins,
+            bin_start: vec![0; NUM_BIN + 1],
+            pool: Pool::new(NB_THREAD as u32),
+        }
+    }
+
+    fn apply_constraint(&mut self) {
+        //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
+        for i in 0..self.len {
+            /*let diff = center - self.pos[i];
+            let len = diff.length();
+            if len > 400.0 - self.radii[i] {
+                let n = diff / len;
+                self.pos[i] = center - n * (400.0 - self.radii[i]);
+            }*/
+
+            let v = self.pos[i].xy() - vec2(850.0, 600.0);
+            let dist2 = v.length_squared();
+            let min_dist = self.pos[i].z + 100.0;
+            if dist2 < min_dist * min_dist {
+                let dist = dist2.sqrt();
+                let n = v / dist;
+                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+            }
+
+            let factor = 0.75;
+
+            if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
+                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
+            }
+            if self.pos[i].x < 100.0 + self.pos[i].z {
+                self.pos[i].x += factor * (100.0 + self.pos[i].z - self.pos[i].x);
+            }
+            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.pos[i].z {
+                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.pos[i].z - self.pos[i].y);
+            }
+            if self.pos[i].y < 100.0 + self.pos[i].z {
+                self.pos[i].y += factor * (100.0 + self.pos[i].z - self.pos[i].y);
+            }
+        }
+    }
+
+    fn update_pos(&mut self, dt: f32) {
+        for i in 0..self.len {
+            let diff = self.pos[i].xy() - self.last_pos[i];
+            self.last_pos[i] = self.pos[i].xy();
+            self.pos[i] += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
+        }
+    }
+
+    fn fill_bins(&mut self) {
+        self.bins.iter_mut().for_each(|b| b.indexes.clear());
+
+        for i in 0..self.len {
+            let pos = self.pos[i].xy() / BIN_SIZE as f32;
+            self.bins[pos.y.floor() as usize + pos.x.floor() as usize * BIN_H]
+                .indexes
+                .push(i);
+        }
+
+        let mut current_ind = 0;
+        for (bi, bin) in self.bins.iter().enumerate() {
+            for (i, &pi) in bin.indexes.iter().enumerate() {
+                self.sorted_pos[current_ind + i] = (self.pos[pi], pi);
+            }
+            self.bin_start[bi] = current_ind;
+            current_ind += bin.indexes.len();
+        }
+        self.bin_start[NUM_BIN] = self.len;
+    }
+
+    fn check_collisions(&mut self) {
+        let chunk_size = NUM_BIN / NB_THREAD;
+        let thread_width = BIN_W / NB_THREAD;
+
+        let breakpoints_thread = self
+            .bin_start
+            .iter()
+            .take(NUM_BIN)
+            .step_by(chunk_size)
+            .map(|&i| i)
+            .collect::<Vec<usize>>();
+
+        let check_slice = |slice_pos: &mut [(Vec3, usize)],
+                           offset: usize,
+                           start_x: usize,
+                           width: usize,
+                           wall: usize| {
+            if slice_pos.len() == 0 {
+                return;
+            }
+            for break_i in (start_x * BIN_H)..((start_x + width) * BIN_H) {
+                let bin_x = break_i / BIN_H;
+                let bin_y = break_i % BIN_H;
+                if bin_x < start_x + wall
+                    || bin_x >= (start_x + width) - wall
+                    || bin_y < 1
+                    || bin_y >= BIN_H - 1
+                {
+                    continue;
+                }
+
+                for i1 in self.bin_start[break_i]..self.bin_start[break_i + 1] {
+                    let (pos1, _) = slice_pos[i1 - offset];
+
+                    for off_i in -1..=1 {
+                        for off_j in -1..=1 {
+                            let bin2ind = (bin_y as i32 + off_j) as usize
+                                + (bin_x as i32 + off_i) as usize * BIN_H;
+
+                            for i2 in self.bin_start[bin2ind]..self.bin_start[bin2ind + 1] {
+                                if i1 >= i2 {
+                                    continue;
+                                }
+
+                                let (pos2, _) = slice_pos[i2 - offset];
+                                let v = pos1.xy() - pos2.xy();
+                                let dist2 = v.length_squared();
+                                let min_dist = pos1.z + pos2.z;
+                                if dist2 < min_dist * min_dist {
+                                    let dist = dist2.sqrt();
+                                    let n = v / dist;
+                                    let mass_ratio_1 = pos2.z / (pos1.z + pos2.z);
+                                    let mass_ratio_2 = pos1.z / (pos1.z + pos2.z);
+                                    let delta = 0.5 * 0.75 * (dist - min_dist);
+                                    slice_pos[i1 - offset].0 -=
+                                        (n * (mass_ratio_1 * delta)).extend(0.0);
+                                    slice_pos[i2 - offset].0 +=
+                                        (n * (mass_ratio_2 * delta)).extend(0.0);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        for odd in 0..2 {
+            self.pool.scoped(|scope| {
+                for (slice_i, (slice_pos, breakpoint)) in
+                    ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
+                        .enumerate()
+                        .filter(|(i, _)| i % 2 == odd)
+                {
+                    scope.execute(move || {
+                        check_slice(
+                            slice_pos,
+                            breakpoint,
+                            slice_i * thread_width,
+                            thread_width,
+                            1,
+                        )
+                    });
+                }
+            });
+        }
+
+        let breakpoints_borders = self
+            .bin_start
+            .iter()
+            .skip(chunk_size / 2)
+            .take(NUM_BIN - chunk_size)
+            .step_by(chunk_size)
+            .map(|&i| i)
+            .collect::<Vec<usize>>();
+
+        // check collisions across thread borders
+        self.pool.scoped(|scope| {
+            for (bid, (slice_pos, breakpoint)) in
+                ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders).enumerate()
+            {
+                scope.execute(move || {
+                    check_slice(slice_pos, breakpoint, (bid + 1) * thread_width - 1, 2, 0)
+                });
+            }
+        });
+
+        for i in 0..self.len {
+            self.pos[self.sorted_pos[i].1] = self.sorted_pos[i].0;
+        }
+    }
+
+    pub fn step(&mut self, dt: f32) {
+        self.update_pos(dt);
+        self.apply_constraint();
+        self.fill_bins();
+        self.check_collisions();
+    }
+
+    pub fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
+        for i in 0..self.len {
+            let v = self.pos[i].xy() - pos;
+            let dist2 = v.length_squared();
+            let min_dist = self.pos[i].z + size;
+            if dist2 < min_dist * min_dist {
+                let dist = dist2.sqrt();
+                let n = v / dist;
+                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+            }
+        }
+    }
+
+    fn add_object(&mut self, pos: Vec2, vel: Vec2) {
+        self.pos[self.len] = pos.extend(self.pos[self.len].z);
+        self.last_pos[self.len] = pos - vel;
+        self.len += 1;
+    }
+
+    pub fn nb_particles(&self) -> usize {
+        return self.len;
+    }
+
+    pub fn emit_flow(&mut self) {
+        let dir = vec2(2.0, 1.0).normalize();
+        let space = MAX_RADIUS * 2.0 + 0.01;
+        for i in 0..16 {
+            let off_y = i as f32 * space;
+            for j in 0..3 {
+                if self.len >= MAX_PARTICLES {
+                    break;
+                }
+                self.add_object(
+                    vec2(200.0, 200.0 + off_y) + dir * space * j as f32,
+                    dir * 2.2 as f32,
+                );
+            }
+        }
+    }
+
+    pub fn get_bins(&self) -> &[Bin] {
+        return &self.bins;
+    }
+
+    pub fn get_points(&self) -> &[Vec3] {
+        return &self.pos;
+    }
+}

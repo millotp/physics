@@ -14,13 +14,14 @@ use miniquad::*;
 use image::io::Reader as ImageReader;
 
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
+use scoped_threadpool::Pool;
 
 const MAX_PARTICLES: usize = 50000;
 const CIRCLE_SIDES: usize = 12;
 const WIDTH: i32 = 1200;
 const HEIGHT: i32 = 1200;
 const BIN_SIZE: f32 = 10.0;
-const NB_THREAD: usize = 15;
+const NB_THREAD: usize = 20;
 
 struct Bin {
     indexes: Vec<usize>,
@@ -59,6 +60,7 @@ struct Stage {
     mouse_pressed: bool,
     mouse_pos: Vec2,
     can_update: UpdateCommand,
+    pool: Pool,
 }
 
 impl Stage {
@@ -195,6 +197,7 @@ impl Stage {
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
             can_update: UpdateCommand::Stop,
+            pool: Pool::new(NB_THREAD as u32),
         }
     }
 
@@ -293,6 +296,9 @@ impl Stage {
                            start_x: usize,
                            width: usize,
                            wall: usize| {
+            if slice_pos.len() == 0 {
+                return;
+            }
             for break_i in (start_x * self.bin_h)..((start_x + width) * self.bin_h) {
                 let bin_x = break_i / self.bin_h;
                 let bin_y = break_i % self.bin_h;
@@ -340,13 +346,13 @@ impl Stage {
         };
 
         for odd in 0..2 {
-            rayon::scope(|scope| {
+            self.pool.scoped(|scope| {
                 for (slice_i, (slice_pos, breakpoint)) in
                     ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
                         .enumerate()
                         .filter(|(i, _)| i % 2 == odd)
                 {
-                    scope.spawn(move |_| {
+                    scope.execute(move || {
                         check_slice(
                             slice_pos,
                             breakpoint,
@@ -356,13 +362,28 @@ impl Stage {
                         )
                     });
                 }
-            })
+            });
         }
 
+        let breakpoints_borders = self
+            .bin_start
+            .iter()
+            .skip(chunk_size / 2)
+            .take(self.num_bin - chunk_size)
+            .step_by(chunk_size)
+            .map(|&i| i)
+            .collect::<Vec<usize>>();
+
         // check collisions across thread borders
-        for bid in 1..NB_THREAD {
-            check_slice(&mut self.sorted_pos, 0, bid * thread_width - 1, 2, 0);
-        }
+        self.pool.scoped(|scope| {
+            for (bid, (slice_pos, breakpoint)) in
+                ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders).enumerate()
+            {
+                scope.execute(move || {
+                    check_slice(slice_pos, breakpoint, (bid + 1) * thread_width - 1, 2, 0)
+                });
+            }
+        });
 
         for i in 0..self.len {
             self.pos[self.sorted_pos[i].1] = self.sorted_pos[i].0;

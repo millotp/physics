@@ -429,6 +429,7 @@ dependencies = [
  "miniquad",
  "quad-rand",
  "rayon",
+ "scoped_threadpool",
 ]
 
 [[package]]

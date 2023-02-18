@@ -7,7 +7,7 @@ pub struct ChunksMutIndices<'a, T: 'a> {
     _marker: PhantomData<&'a mut T>,
 }
 
-impl<'a, T: 'a> ChunksMutIndices<'a, T> {
+impl<'a, T: 'a + Sync> ChunksMutIndices<'a, T> {
     #[inline]
     pub fn new(slice: &'a mut [T], breakpoints: &'a [usize]) -> Self {
         Self {

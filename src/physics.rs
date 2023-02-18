@@ -1,9 +1,9 @@
 use glam::{vec2, vec3, Vec2, Vec3, Vec3Swizzles};
-use scoped_threadpool::Pool;
+use rayon::prelude::*;
 
 use crate::{chunk_iter::ChunksMutIndices, HEIGHT, WIDTH};
 
-pub const MAX_PARTICLES: usize = 50000;
+pub const MAX_PARTICLES: usize = 70000;
 const MAX_RADIUS: f32 = 2.5;
 pub const NB_THREAD: usize = 24;
 const BIN_SIZE: usize = 5;
@@ -33,7 +33,6 @@ pub struct Physics {
     sorted_pos: Vec<(Vec3, usize)>,
     bins: Vec<Bin>,
     bin_start: Vec<usize>,
-    pool: Pool,
 }
 
 impl Physics {
@@ -50,6 +49,11 @@ impl Physics {
 
         let bins = (0..NUM_BIN).map(|_| Bin::new()).collect();
 
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(NB_THREAD)
+            .build_global()
+            .unwrap();
+
         Physics {
             len: 0,
             pos,
@@ -57,7 +61,6 @@ impl Physics {
             sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
             bins,
             bin_start: vec![0; NUM_BIN + 1],
-            pool: Pool::new(NB_THREAD as u32),
         }
     }
 
@@ -192,25 +195,19 @@ impl Physics {
             }
         };
 
-        for odd in 0..2 {
-            self.pool.scoped(|scope| {
-                for (slice_i, (slice_pos, breakpoint)) in
-                    ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
-                        .enumerate()
-                        .filter(|(i, _)| i % 2 == odd)
-                {
-                    scope.execute(move || {
-                        check_slice(
-                            slice_pos,
-                            breakpoint,
-                            slice_i * thread_width,
-                            thread_width,
-                            1,
-                        )
-                    });
-                }
+        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
+            .enumerate()
+            .collect::<Vec<(usize, (&mut [(Vec3, usize)], usize))>>()
+            .par_iter_mut()
+            .for_each(|(slice_i, (slice_pos, breakpoint))| {
+                check_slice(
+                    slice_pos,
+                    *breakpoint,
+                    *slice_i * thread_width,
+                    thread_width,
+                    1,
+                )
             });
-        }
 
         let breakpoints_borders = self
             .bin_start
@@ -222,15 +219,19 @@ impl Physics {
             .collect::<Vec<usize>>();
 
         // check collisions across thread borders
-        self.pool.scoped(|scope| {
-            for (bid, (slice_pos, breakpoint)) in
-                ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders).enumerate()
-            {
-                scope.execute(move || {
-                    check_slice(slice_pos, breakpoint, (bid + 1) * thread_width - 1, 2, 0)
-                });
-            }
-        });
+        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders)
+            .enumerate()
+            .collect::<Vec<(usize, (&mut [(Vec3, usize)], usize))>>()
+            .par_iter_mut()
+            .for_each(|(slice_i, (slice_pos, breakpoint))| {
+                check_slice(
+                    slice_pos,
+                    *breakpoint,
+                    (*slice_i + 1) * thread_width - 1,
+                    2,
+                    0,
+                )
+            });
 
         for i in 0..self.len {
             self.pos[self.sorted_pos[i].1] = self.sorted_pos[i].0;

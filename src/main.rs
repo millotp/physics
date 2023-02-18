@@ -27,6 +27,7 @@ enum UpdateCommand {
     OneFrame,
     Continue,
     Stop,
+    Quit,
 }
 
 struct Stage {
@@ -161,9 +162,14 @@ impl Stage {
 }
 
 impl EventHandler for Stage {
-    fn update(&mut self, _: &mut Context) {
-        if let UpdateCommand::Stop = self.can_update {
-            return;
+    fn update(&mut self, ctx: &mut Context) {
+        match self.can_update {
+            UpdateCommand::Stop => return,
+            UpdateCommand::Quit => {
+                ctx.quit();
+                return;
+            }
+            _ => (),
         }
 
         let start = Instant::now();
@@ -303,11 +309,11 @@ impl EventHandler for Stage {
             KeyCode::N => self.can_update = UpdateCommand::OneFrame,
             KeyCode::Space => {
                 self.can_update = match self.can_update {
-                    UpdateCommand::OneFrame => UpdateCommand::Continue,
                     UpdateCommand::Continue => UpdateCommand::Stop,
-                    UpdateCommand::Stop => UpdateCommand::Continue,
+                    _ => UpdateCommand::Continue,
                 }
             }
+            KeyCode::Escape => self.can_update = UpdateCommand::Quit,
             _ => (),
         }
     }

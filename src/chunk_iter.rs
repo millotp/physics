@@ -41,3 +41,5 @@ impl<'a, T> Iterator for ChunksMutIndices<'a, T> {
         }
     }
 }
+
+unsafe impl<'a, T> Send for ChunksMutIndices<'a, T> {}

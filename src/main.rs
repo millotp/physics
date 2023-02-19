@@ -41,6 +41,7 @@ struct Stage {
     mouse_pressed: bool,
     mouse_pos: Vec2,
     can_update: UpdateCommand,
+    accumulate_time: u128,
 }
 
 impl Stage {
@@ -116,7 +117,8 @@ impl Stage {
             frame_count: 0,
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
-            can_update: UpdateCommand::Stop,
+            can_update: UpdateCommand::Continue,
+            accumulate_time: 0,
         }
     }
 
@@ -178,8 +180,8 @@ impl EventHandler for Stage {
         self.physics.emit_flow();
 
         // update particle positions
-        for _ in 0..8 {
-            self.physics.step(dt / 8.0);
+        for _ in 0..10 {
+            self.physics.step(dt / 10.0);
         }
 
         if self.mouse_pressed {
@@ -187,13 +189,15 @@ impl EventHandler for Stage {
         }
 
         self.frame_count += 1;
+        self.accumulate_time += self.last_frame.elapsed().as_micros();
         if self.frame_count % 30 == 0 {
             println!(
                 "objects: {}, fps: {}, time to update: {}",
                 self.physics.nb_particles(),
-                1000000 / self.last_frame.elapsed().as_micros(),
+                1000000 / (self.accumulate_time / 30),
                 start.elapsed().as_micros()
             );
+            self.accumulate_time = 0;
         }
         self.last_frame = Instant::now();
 
@@ -285,8 +289,14 @@ impl EventHandler for Stage {
                     .physics
                     .get_points()
                     .iter()
-                    .enumerate()
                     .take(self.physics.nb_particles())
+                    .map(|p| {
+                        p.clamp(
+                            vec3(100.0 + p.z, 100.0 + p.z, p.z),
+                            vec3(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z, p.z),
+                        )
+                    })
+                    .enumerate()
                 {
                     self.colors[i] = match point.y < 400.0 {
                         true => Vec3::ONE,

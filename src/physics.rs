@@ -21,7 +21,7 @@ pub struct Bin {
 impl Bin {
     fn new() -> Self {
         Bin {
-            indexes: Vec::with_capacity(10),
+            indexes: Vec::with_capacity(15),
         }
     }
 }
@@ -65,6 +65,7 @@ impl Physics {
     }
 
     fn apply_constraint(&mut self) {
+        let factor = 0.75;
         //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
         for i in 0..self.len {
             /*let diff = center - self.pos[i];
@@ -83,8 +84,6 @@ impl Physics {
                 self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
             }
 
-            let factor = 0.75;
-
             if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
                 self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
             }
@@ -101,10 +100,10 @@ impl Physics {
     }
 
     fn update_pos(&mut self, dt: f32) {
-        for i in 0..self.len {
-            let diff = self.pos[i].xy() - self.last_pos[i];
-            self.last_pos[i] = self.pos[i].xy();
-            self.pos[i] += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
+        for (i, pos) in self.pos.iter_mut().take(self.len).enumerate() {
+            let diff = pos.xy() - self.last_pos[i];
+            self.last_pos[i] = pos.xy();
+            *pos += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
         }
     }
 
@@ -113,7 +112,7 @@ impl Physics {
 
         for i in 0..self.len {
             let pos = self.pos[i].xy() / BIN_SIZE as f32;
-            self.bins[pos.y.floor() as usize + pos.x.floor() as usize * BIN_H]
+            self.bins[pos.y as usize + pos.x as usize * BIN_H]
                 .indexes
                 .push(i);
         }
@@ -149,9 +148,9 @@ impl Physics {
             if slice_pos.is_empty() {
                 return;
             }
-            for break_i in (start_x * BIN_H)..((start_x + width) * BIN_H) {
-                let bin_x = break_i / BIN_H;
-                let bin_y = break_i % BIN_H;
+            for bin1 in (start_x * BIN_H)..((start_x + width) * BIN_H) {
+                let bin_x = bin1 / BIN_H;
+                let bin_y = bin1 % BIN_H;
                 if bin_x < start_x + wall
                     || bin_x >= (start_x + width) - wall
                     || bin_y < 1
@@ -160,20 +159,23 @@ impl Physics {
                     continue;
                 }
 
-                for i1 in self.bin_start[break_i]..self.bin_start[break_i + 1] {
+                for i1 in self.bin_start[bin1]..self.bin_start[bin1 + 1] {
                     let (pos1, _) = slice_pos[i1 - offset];
 
                     for off_i in -1..=1 {
                         for off_j in -1..=1 {
-                            let bin2ind = (bin_y as i32 + off_j) as usize
+                            let bin2 = (bin_y as i32 + off_j) as usize
                                 + (bin_x as i32 + off_i) as usize * BIN_H;
 
-                            for i2 in self.bin_start[bin2ind]..self.bin_start[bin2ind + 1] {
+                            for i2 in unsafe {
+                                *self.bin_start.get_unchecked(bin2)
+                                    ..*self.bin_start.get_unchecked(bin2 + 1)
+                            } {
                                 if i1 >= i2 {
                                     continue;
                                 }
 
-                                let (pos2, _) = slice_pos[i2 - offset];
+                                let (pos2, _) = unsafe { slice_pos.get_unchecked(i2 - offset) };
                                 let v = pos1.xy() - pos2.xy();
                                 let dist2 = v.length_squared();
                                 let min_dist = pos1.z + pos2.z;
@@ -197,13 +199,12 @@ impl Physics {
 
         ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
             .enumerate()
-            .collect::<Vec<(usize, (&mut [(Vec3, usize)], usize))>>()
-            .par_iter_mut()
+            .par_bridge()
             .for_each(|(slice_i, (slice_pos, breakpoint))| {
                 check_slice(
                     slice_pos,
-                    *breakpoint,
-                    *slice_i * thread_width,
+                    breakpoint,
+                    slice_i * thread_width,
                     thread_width,
                     1,
                 )
@@ -221,20 +222,19 @@ impl Physics {
         // check collisions across thread borders
         ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders)
             .enumerate()
-            .collect::<Vec<(usize, (&mut [(Vec3, usize)], usize))>>()
-            .par_iter_mut()
+            .par_bridge()
             .for_each(|(slice_i, (slice_pos, breakpoint))| {
                 check_slice(
                     slice_pos,
-                    *breakpoint,
-                    (*slice_i + 1) * thread_width - 1,
+                    breakpoint,
+                    (slice_i + 1) * thread_width - 1,
                     2,
                     0,
                 )
             });
 
-        for i in 0..self.len {
-            self.pos[self.sorted_pos[i].1] = self.sorted_pos[i].0;
+        for sp in self.sorted_pos.iter().take(self.len) {
+            self.pos[sp.1] = sp.0;
         }
     }
 

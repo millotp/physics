@@ -1,10 +1,10 @@
-use glam::{vec2, vec3, Vec2, Vec3, Vec3Swizzles};
+use glam::{vec2, Vec2};
 use rayon::prelude::*;
 
 use crate::{chunk_iter::ChunksMutIndices, HEIGHT, WIDTH};
 
 pub const MAX_PARTICLES: usize = 70000;
-const MAX_RADIUS: f32 = 2.5;
+pub const MAX_RADIUS: f32 = 2.0;
 pub const NB_THREAD: usize = 24;
 const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
@@ -28,9 +28,9 @@ impl Bin {
 
 pub struct Physics {
     len: usize,
-    pos: Vec<Vec3>,
+    pos: Vec<Vec2>,
     last_pos: Vec<Vec2>,
-    sorted_pos: Vec<(Vec3, usize)>,
+    sorted_pos: Vec<(Vec2, usize)>,
     bins: Vec<Bin>,
     bin_start: Vec<usize>,
 }
@@ -38,14 +38,8 @@ pub struct Physics {
 impl Physics {
     pub fn new() -> Physics {
         let pos = (0..MAX_PARTICLES)
-            .map(|_| {
-                vec3(
-                    0.0,
-                    0.0,
-                    quad_rand::gen_range(MAX_RADIUS * 0.5, MAX_RADIUS * 0.6),
-                )
-            })
-            .collect::<Vec<Vec3>>();
+            .map(|_| vec2(0.0, 0.0))
+            .collect::<Vec<Vec2>>();
 
         let bins = (0..NUM_BIN).map(|_| Bin::new()).collect();
 
@@ -58,7 +52,7 @@ impl Physics {
             len: 0,
             pos,
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
-            sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
+            sorted_pos: vec![(Vec2::ZERO, 0); MAX_PARTICLES],
             bins,
             bin_start: vec![0; NUM_BIN + 1],
         }
@@ -75,35 +69,35 @@ impl Physics {
                 self.pos[i] = center - n * (400.0 - self.radii[i]);
             }*/
 
-            let v = self.pos[i].xy() - vec2(850.0, 600.0);
+            let v = self.pos[i] - vec2(850.0, 600.0);
             let dist2 = v.length_squared();
-            let min_dist = self.pos[i].z + 100.0;
+            let min_dist = MAX_RADIUS + 100.0;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+                self.pos[i] -= n * 0.1 * (dist - min_dist);
             }
 
-            if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
+            if self.pos[i].x > WIDTH as f32 - 100.0 - MAX_RADIUS {
+                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - MAX_RADIUS - self.pos[i].x);
             }
-            if self.pos[i].x < 100.0 + self.pos[i].z {
-                self.pos[i].x += factor * (100.0 + self.pos[i].z - self.pos[i].x);
+            if self.pos[i].x < 100.0 + MAX_RADIUS {
+                self.pos[i].x += factor * (100.0 + MAX_RADIUS - self.pos[i].x);
             }
-            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.pos[i].z - self.pos[i].y);
+            if self.pos[i].y > HEIGHT as f32 - 100.0 - MAX_RADIUS {
+                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - MAX_RADIUS - self.pos[i].y);
             }
-            if self.pos[i].y < 100.0 + self.pos[i].z {
-                self.pos[i].y += factor * (100.0 + self.pos[i].z - self.pos[i].y);
+            if self.pos[i].y < 100.0 + MAX_RADIUS {
+                self.pos[i].y += factor * (100.0 + MAX_RADIUS - self.pos[i].y);
             }
         }
     }
 
     fn update_pos(&mut self, dt: f32) {
         for (i, pos) in self.pos.iter_mut().take(self.len).enumerate() {
-            let diff = pos.xy() - self.last_pos[i];
-            self.last_pos[i] = pos.xy();
-            *pos += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
+            let diff = *pos - self.last_pos[i];
+            self.last_pos[i] = *pos;
+            *pos += diff + vec2(10.0, 200.0) * (dt * dt);
         }
     }
 
@@ -111,7 +105,7 @@ impl Physics {
         self.bins.iter_mut().for_each(|b| b.indexes.clear());
 
         for i in 0..self.len {
-            let pos = self.pos[i].xy() / BIN_SIZE as f32;
+            let pos = self.pos[i] / BIN_SIZE as f32;
             self.bins[pos.y as usize + pos.x as usize * BIN_H]
                 .indexes
                 .push(i);
@@ -140,7 +134,7 @@ impl Physics {
             .copied()
             .collect::<Vec<usize>>();
 
-        let check_slice = |slice_pos: &mut [(Vec3, usize)],
+        let check_slice = |slice_pos: &mut [(Vec2, usize)],
                            offset: usize,
                            start_x: usize,
                            width: usize,
@@ -175,20 +169,15 @@ impl Physics {
                                     continue;
                                 }
 
-                                let (pos2, _) = unsafe { slice_pos.get_unchecked(i2 - offset) };
-                                let v = pos1.xy() - pos2.xy();
+                                let (pos2, _) = unsafe { *slice_pos.get_unchecked(i2 - offset) };
+                                let v = pos1 - pos2;
                                 let dist2 = v.length_squared();
-                                let min_dist = pos1.z + pos2.z;
+                                let min_dist = 2.0 * MAX_RADIUS;
                                 if dist2 < min_dist * min_dist {
                                     let dist = dist2.sqrt();
-                                    let n = v / dist;
-                                    let mass_ratio_1 = pos2.z / (pos1.z + pos2.z);
-                                    let mass_ratio_2 = pos1.z / (pos1.z + pos2.z);
-                                    let delta = 0.5 * 0.75 * (dist - min_dist);
-                                    slice_pos[i1 - offset].0 -=
-                                        (n * (mass_ratio_1 * delta)).extend(0.0);
-                                    slice_pos[i2 - offset].0 +=
-                                        (n * (mass_ratio_2 * delta)).extend(0.0);
+                                    let n = v / dist * (0.5 * 0.5 * 0.75) * (dist - min_dist);
+                                    slice_pos[i1 - offset].0 -= n;
+                                    slice_pos[i2 - offset].0 += n;
                                 }
                             }
                         }
@@ -247,19 +236,19 @@ impl Physics {
 
     pub fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
         for i in 0..self.len {
-            let v = self.pos[i].xy() - pos;
+            let v = self.pos[i] - pos;
             let dist2 = v.length_squared();
-            let min_dist = self.pos[i].z + size;
+            let min_dist = MAX_RADIUS + size;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+                self.pos[i] -= n * 0.1 * (dist - min_dist);
             }
         }
     }
 
     fn add_object(&mut self, pos: Vec2, vel: Vec2) {
-        self.pos[self.len] = pos.extend(self.pos[self.len].z);
+        self.pos[self.len] = pos;
         self.last_pos[self.len] = pos - vel;
         self.len += 1;
     }
@@ -289,7 +278,7 @@ impl Physics {
         &self.bins
     }
 
-    pub fn get_points(&self) -> &[Vec3] {
+    pub fn get_points(&self) -> &[Vec2] {
         &self.pos
     }
 }

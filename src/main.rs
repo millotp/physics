@@ -19,6 +19,8 @@ use image::io::Reader as ImageReader;
 use glam::{vec2, vec3, Mat4, Vec2, Vec3};
 use physics::{Physics, BIN_W, MAX_PARTICLES, NB_THREAD};
 
+use crate::physics::MAX_RADIUS;
+
 const CIRCLE_SIDES: usize = 12;
 const WIDTH: usize = 1200;
 const HEIGHT: usize = 1200;
@@ -72,7 +74,7 @@ impl Stage {
         let positions_vertex_buffer = Buffer::stream(
             ctx,
             BufferType::VertexBuffer,
-            MAX_PARTICLES * std::mem::size_of::<Vec3>(),
+            MAX_PARTICLES * std::mem::size_of::<Vec2>(),
         );
 
         let bindings = Bindings {
@@ -101,8 +103,8 @@ impl Stage {
                 },
             ],
             &[
-                VertexAttribute::with_buffer("pos", VertexFormat::Float2, 0),
-                VertexAttribute::with_buffer("pos_radius", VertexFormat::Float3, 1),
+                VertexAttribute::with_buffer("geom", VertexFormat::Float2, 0),
+                VertexAttribute::with_buffer("pos", VertexFormat::Float2, 1),
                 VertexAttribute::with_buffer("color0", VertexFormat::Float3, 2),
             ],
             shader,
@@ -180,8 +182,8 @@ impl EventHandler for Stage {
         self.physics.emit_flow();
 
         // update particle positions
-        for _ in 0..10 {
-            self.physics.step(dt / 10.0);
+        for _ in 0..8 {
+            self.physics.step(dt / 8.0);
         }
 
         if self.mouse_pressed {
@@ -292,8 +294,11 @@ impl EventHandler for Stage {
                     .take(self.physics.nb_particles())
                     .map(|p| {
                         p.clamp(
-                            vec3(100.0 + p.z, 100.0 + p.z, p.z),
-                            vec3(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z, p.z),
+                            vec2(100.0 + MAX_RADIUS, 100.0 + MAX_RADIUS),
+                            vec2(
+                                WIDTH as f32 - 100.0 - MAX_RADIUS,
+                                HEIGHT as f32 - 100.0 - MAX_RADIUS,
+                            ),
                         )
                     })
                     .enumerate()

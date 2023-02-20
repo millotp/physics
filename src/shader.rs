@@ -1,8 +1,8 @@
 use miniquad::*;
 
 pub const VERTEX: &str = r#"#version 100
+  attribute vec2 geom;
   attribute vec2 pos;
-  attribute vec3 pos_radius;
   attribute vec3 color0;
 
   varying lowp vec4 color;
@@ -10,8 +10,8 @@ pub const VERTEX: &str = r#"#version 100
   uniform mat4 mvp;
 
   void main() {
-      vec4 pos = vec4(pos * pos_radius.z + pos_radius.xy, 0.0, 1.0);
-      gl_Position = mvp * pos;
+      vec4 rpos = vec4(geom * 2.0 + pos, 0.0, 1.0);
+      gl_Position = mvp * rpos;
       color = vec4(color0, 1.0);
   }
   "#;

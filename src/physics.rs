@@ -1,11 +1,11 @@
-use glam::{vec2, vec3, Vec2, Vec3, Vec3Swizzles};
+use glam::{vec2, vec3, Vec2, Vec3};
 use rayon::prelude::*;
 
-use crate::{chunk_iter::ChunksMutIndices, HEIGHT, WIDTH};
+use crate::{chunk_iter::ChunksMutIndices, BORDER, HEIGHT, WIDTH};
 
 pub const MAX_PARTICLES: usize = 70000;
-const MAX_RADIUS: f32 = 2.5;
-pub const NB_THREAD: usize = 24;
+const MAX_RADIUS: f32 = 1.5;
+pub const NB_THREAD: usize = 10;
 const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
 const BIN_H: usize = HEIGHT / BIN_SIZE;
@@ -26,92 +26,90 @@ impl Bin {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub struct Ball {
+    pub pos: Vec2,
+    pub last_pos: Vec2,
+    pub radius: f32,
+    pub neighboors: u16,
+}
+
 pub struct Physics {
     len: usize,
-    pos: Vec<Vec3>,
-    last_pos: Vec<Vec2>,
-    sorted_pos: Vec<(Vec3, usize)>,
+    balls: Vec<Ball>,
+    sorted_balls: Vec<(Ball, usize)>,
     bins: Vec<Bin>,
     bin_start: Vec<usize>,
 }
 
 impl Physics {
     pub fn new() -> Physics {
-        let pos = (0..MAX_PARTICLES)
-            .map(|_| {
-                vec3(
-                    0.0,
-                    0.0,
-                    quad_rand::gen_range(MAX_RADIUS * 0.5, MAX_RADIUS * 0.6),
-                )
+        let balls = (0..MAX_PARTICLES)
+            .map(|_| Ball {
+                pos: vec2(0.0, 0.0),
+                last_pos: Vec2::ZERO,
+                radius: quad_rand::gen_range(MAX_RADIUS * 0.9, MAX_RADIUS),
+                neighboors: 0,
             })
-            .collect::<Vec<Vec3>>();
+            .collect::<Vec<Ball>>();
 
         let bins = (0..NUM_BIN).map(|_| Bin::new()).collect();
 
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(NB_THREAD)
-            .build_global()
-            .unwrap();
+        //rayon::ThreadPoolBuilder::new()
+        //    .num_threads(NB_THREAD)
+        //    .build_global()
+        //   .unwrap();
 
         Physics {
             len: 0,
-            pos,
-            last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
-            sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
+            balls,
+            sorted_balls: vec![(Ball::default(), 0); MAX_PARTICLES],
             bins,
             bin_start: vec![0; NUM_BIN + 1],
         }
     }
 
+    fn update_pos(&mut self, gravity: Vec2, dt: f32) {
+        self.balls.iter_mut().take(self.len).for_each(|b| {
+            let diff = b.pos - b.last_pos;
+            b.last_pos = b.pos;
+            b.neighboors = 0;
+            b.pos += diff + gravity * (dt * dt);
+        });
+    }
+
     fn apply_constraint(&mut self) {
         let factor = 0.75;
-        //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
-        for i in 0..self.len {
-            /*let diff = center - self.pos[i];
-            let len = diff.length();
-            if len > 400.0 - self.radii[i] {
-                let n = diff / len;
-                self.pos[i] = center - n * (400.0 - self.radii[i]);
-            }*/
-
-            let v = self.pos[i].xy() - vec2(850.0, 600.0);
+        self.balls.par_iter_mut().take(self.len).for_each(|b| {
+            let v = b.pos - vec2(250.0, 700.0);
             let dist2 = v.length_squared();
-            let min_dist = self.pos[i].z + 100.0;
+            let min_dist = b.radius + 100.0;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+                b.pos -= n * 0.1 * (dist - min_dist);
             }
 
-            if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
+            if b.pos.x > WIDTH as f32 - BORDER - b.radius {
+                b.pos.x += factor * (WIDTH as f32 - BORDER - b.radius - b.pos.x);
             }
-            if self.pos[i].x < 100.0 + self.pos[i].z {
-                self.pos[i].x += factor * (100.0 + self.pos[i].z - self.pos[i].x);
+            if b.pos.x < BORDER + b.radius {
+                b.pos.x += factor * (BORDER + b.radius - b.pos.x);
             }
-            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.pos[i].z - self.pos[i].y);
+            if b.pos.y > HEIGHT as f32 - BORDER - b.radius {
+                b.pos.y += factor * (HEIGHT as f32 - BORDER - b.radius - b.pos.y);
             }
-            if self.pos[i].y < 100.0 + self.pos[i].z {
-                self.pos[i].y += factor * (100.0 + self.pos[i].z - self.pos[i].y);
+            if b.pos.y < BORDER + b.radius {
+                b.pos.y += factor * (BORDER + b.radius - b.pos.y);
             }
-        }
-    }
-
-    fn update_pos(&mut self, dt: f32) {
-        for (i, pos) in self.pos.iter_mut().take(self.len).enumerate() {
-            let diff = pos.xy() - self.last_pos[i];
-            self.last_pos[i] = pos.xy();
-            *pos += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
-        }
+        });
     }
 
     fn fill_bins(&mut self) {
         self.bins.iter_mut().for_each(|b| b.indexes.clear());
 
         for i in 0..self.len {
-            let pos = self.pos[i].xy() / BIN_SIZE as f32;
+            let pos = self.balls[i].pos / BIN_SIZE as f32;
             self.bins[pos.y as usize + pos.x as usize * BIN_H]
                 .indexes
                 .push(i);
@@ -120,7 +118,7 @@ impl Physics {
         let mut current_ind = 0;
         for (bi, bin) in self.bins.iter().enumerate() {
             for (i, &pi) in bin.indexes.iter().enumerate() {
-                self.sorted_pos[current_ind + i] = (self.pos[pi], pi);
+                self.sorted_balls[current_ind + i] = (self.balls[pi], pi);
             }
             self.bin_start[bi] = current_ind;
             current_ind += bin.indexes.len();
@@ -140,12 +138,12 @@ impl Physics {
             .copied()
             .collect::<Vec<usize>>();
 
-        let check_slice = |slice_pos: &mut [(Vec3, usize)],
+        let check_slice = |slice_balls: &mut [(Ball, usize)],
                            offset: usize,
                            start_x: usize,
                            width: usize,
                            wall: usize| {
-            if slice_pos.is_empty() {
+            if slice_balls.is_empty() {
                 return;
             }
             for bin1 in (start_x * BIN_H)..((start_x + width) * BIN_H) {
@@ -160,7 +158,7 @@ impl Physics {
                 }
 
                 for i1 in self.bin_start[bin1]..self.bin_start[bin1 + 1] {
-                    let (pos1, _) = slice_pos[i1 - offset];
+                    let (ball1, _) = slice_balls[i1 - offset];
 
                     for off_i in -1..=1 {
                         for off_j in -1..=1 {
@@ -175,20 +173,20 @@ impl Physics {
                                     continue;
                                 }
 
-                                let (pos2, _) = unsafe { slice_pos.get_unchecked(i2 - offset) };
-                                let v = pos1.xy() - pos2.xy();
+                                let (ball2, _) = unsafe { slice_balls.get_unchecked(i2 - offset) };
+                                let v = ball1.pos - ball2.pos;
                                 let dist2 = v.length_squared();
-                                let min_dist = pos1.z + pos2.z;
+                                let min_dist = ball1.radius + ball2.radius;
                                 if dist2 < min_dist * min_dist {
                                     let dist = dist2.sqrt();
                                     let n = v / dist;
-                                    let mass_ratio_1 = pos2.z / (pos1.z + pos2.z);
-                                    let mass_ratio_2 = pos1.z / (pos1.z + pos2.z);
+                                    let mass_ratio_1 = ball2.radius / (ball1.radius + ball2.radius);
+                                    let mass_ratio_2 = ball1.radius / (ball1.radius + ball2.radius);
                                     let delta = 0.5 * 0.75 * (dist - min_dist);
-                                    slice_pos[i1 - offset].0 -=
-                                        (n * (mass_ratio_1 * delta)).extend(0.0);
-                                    slice_pos[i2 - offset].0 +=
-                                        (n * (mass_ratio_2 * delta)).extend(0.0);
+                                    slice_balls[i1 - offset].0.pos -= n * (mass_ratio_1 * delta);
+                                    slice_balls[i2 - offset].0.pos += n * (mass_ratio_2 * delta);
+                                    slice_balls[i1 - offset].0.neighboors += 1;
+                                    slice_balls[i2 - offset].0.neighboors += 1;
                                 }
                             }
                         }
@@ -197,12 +195,12 @@ impl Physics {
             }
         };
 
-        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
+        ChunksMutIndices::new(&mut self.sorted_balls, &breakpoints_thread)
             .enumerate()
             .par_bridge()
-            .for_each(|(slice_i, (slice_pos, breakpoint))| {
+            .for_each(|(slice_i, (slice_balls, breakpoint))| {
                 check_slice(
-                    slice_pos,
+                    slice_balls,
                     breakpoint,
                     slice_i * thread_width,
                     thread_width,
@@ -220,12 +218,12 @@ impl Physics {
             .collect::<Vec<usize>>();
 
         // check collisions across thread borders
-        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders)
+        ChunksMutIndices::new(&mut self.sorted_balls, &breakpoints_borders)
             .enumerate()
             .par_bridge()
-            .for_each(|(slice_i, (slice_pos, breakpoint))| {
+            .for_each(|(slice_i, (slice_balls, breakpoint))| {
                 check_slice(
-                    slice_pos,
+                    slice_balls,
                     breakpoint,
                     (slice_i + 1) * thread_width - 1,
                     2,
@@ -233,13 +231,13 @@ impl Physics {
                 )
             });
 
-        for sp in self.sorted_pos.iter().take(self.len) {
-            self.pos[sp.1] = sp.0;
+        for sp in self.sorted_balls.iter().take(self.len) {
+            self.balls[sp.1] = sp.0;
         }
     }
 
-    pub fn step(&mut self, dt: f32) {
-        self.update_pos(dt);
+    pub fn step(&mut self, gravity: Vec2, dt: f32) {
+        self.update_pos(gravity, dt);
         self.apply_constraint();
         self.fill_bins();
         self.check_collisions();
@@ -247,20 +245,20 @@ impl Physics {
 
     pub fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
         for i in 0..self.len {
-            let v = self.pos[i].xy() - pos;
+            let v = self.balls[i].pos - pos;
             let dist2 = v.length_squared();
-            let min_dist = self.pos[i].z + size;
+            let min_dist = self.balls[i].radius + size;
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+                self.balls[i].pos -= n * 0.1 * (dist - min_dist);
             }
         }
     }
 
     fn add_object(&mut self, pos: Vec2, vel: Vec2) {
-        self.pos[self.len] = pos.extend(self.pos[self.len].z);
-        self.last_pos[self.len] = pos - vel;
+        self.balls[self.len].pos = pos;
+        self.balls[self.len].last_pos = pos - vel;
         self.len += 1;
     }
 
@@ -289,7 +287,28 @@ impl Physics {
         &self.bins
     }
 
-    pub fn get_points(&self) -> &[Vec3] {
-        &self.pos
+    pub fn get_balls(&self) -> &[Ball] {
+        &self.balls
+    }
+
+    pub fn get_points(&self) -> Vec<Vec2> {
+        self.balls.iter().map(|b| b.pos).collect()
+    }
+
+    pub fn get_radius(&self) -> Vec<f32> {
+        self.balls.iter().map(|b| b.radius).collect()
+    }
+
+    pub fn get_colors(&self) -> Vec<Vec3> {
+        self.balls
+            .iter()
+            .map(|b| {
+                vec3(
+                    b.neighboors as f32 / 10.0,
+                    0.7 - b.neighboors as f32 / 15.0,
+                    0.9 - b.neighboors as f32 / 15.0,
+                )
+            })
+            .collect()
     }
 }

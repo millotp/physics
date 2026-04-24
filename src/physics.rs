@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
-use crate::{chunk_iter::ChunksMutIndices, HEIGHT, WIDTH};
+use crate::{HEIGHT, WIDTH};
 
 /// Per-stage microsecond accumulators. Zero-cost in release unless
 /// `BENCH_BREAKDOWN=1` is set at runtime (the timers are always recorded,
@@ -306,17 +306,30 @@ impl Physics {
             }
         };
 
-        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_thread)
-            .enumerate()
-            .par_bridge()
-            .for_each(|(slice_i, (slice_pos, breakpoint))| {
-                check_slice(
-                    slice_pos,
-                    breakpoint,
-                    slice_i * thread_width,
-                    thread_width,
-                    1,
-                )
+        // Main pass: split sorted_pos into NB_THREAD contiguous chunks using
+        // breakpoints_thread, one per column-strip. `split_at_mut` chain produces
+        // NB_THREAD disjoint &mut sub-slices — same pattern as the border pass above,
+        // replacing the old `par_bridge` (which serialises on an internal mutex).
+        let mut main_subs: Vec<(&mut [(Vec3, usize)], usize, usize)> =
+            Vec::with_capacity(NB_THREAD);
+        let mut rest: &mut [(Vec3, usize)] = &mut self.sorted_pos[..];
+        for slice_i in 0..NB_THREAD {
+            let a = breakpoints_thread[slice_i];
+            let b = if slice_i + 1 < NB_THREAD {
+                breakpoints_thread[slice_i + 1]
+            } else {
+                self.len
+            };
+            let skip = a - main_subs.last().map(|s| s.1 + s.0.len()).unwrap_or(0);
+            let (_, after) = rest.split_at_mut(skip);
+            let (sub, tail) = after.split_at_mut(b - a);
+            main_subs.push((sub, a, slice_i * thread_width));
+            rest = tail;
+        }
+        main_subs
+            .into_par_iter()
+            .for_each(|(slice_pos, offset, start_x)| {
+                check_slice(slice_pos, offset, start_x, thread_width, 1);
             });
 
         // Strips for bin1 in columns (start_x, start_x+1) need 3x3 in column range

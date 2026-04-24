@@ -5,7 +5,6 @@ use std::{
     time::Instant,
 };
 
-mod chunk_iter;
 mod physics;
 mod shader;
 

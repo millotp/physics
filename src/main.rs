@@ -1,5 +1,3 @@
-#![feature(raw_slice_split)]
-
 use std::{
     f32::consts::PI,
     fs::File,
@@ -15,7 +13,7 @@ use miniquad::*;
 
 use image::ImageReader;
 
-use glam::{vec2, vec3, Mat4, Vec2, Vec3};
+use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
 use physics::{Physics, BIN_W, MAX_PARTICLES, NB_THREAD};
 
 const CIRCLE_SIDES: usize = 12;
@@ -29,6 +27,13 @@ enum UpdateCommand {
     Quit,
 }
 
+impl Copy for UpdateCommand {}
+impl Clone for UpdateCommand {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
 struct Stage {
     ctx: Box<dyn RenderingBackend>,
     pipeline: Pipeline,
@@ -40,7 +45,7 @@ struct Stage {
     frame_count: usize,
     mouse_pressed: bool,
     mouse_pos: Vec2,
-    can_update: UpdateCommand,
+    update_mode: UpdateCommand,
     accumulate_time: u128,
 }
 
@@ -138,37 +143,35 @@ impl Stage {
             frame_count: 0,
             mouse_pressed: false,
             mouse_pos: Vec2::ZERO,
-            can_update: UpdateCommand::Continue,
+            update_mode: UpdateCommand::Continue,
             accumulate_time: 0,
         }
     }
 
     fn init_colors() -> Vec<Vec3> {
-        let file = File::open("colors.txt");
-        match file {
-            Ok(mut file) => {
-                let mut data: Vec<u8> = Vec::new();
-                file.read_to_end(&mut data).unwrap();
-                if data.len() == 3 * MAX_PARTICLES {
-                    data.chunks(3)
-                        .map(|col| {
-                            vec3(
-                                col[0] as f32 / 255.0,
-                                col[1] as f32 / 255.0,
-                                col[2] as f32 / 255.0,
-                            )
-                        })
-                        .collect()
-                } else {
-                    println!(
-                        "colors.txt file is meant for {} particles, generating random colors",
-                        data.len() / 3
-                    );
-                    Stage::init_random_colors()
-                }
-            }
-            _ => Stage::init_random_colors(),
+        let mut file = match File::open("colors.txt") {
+            Ok(file) => file,
+            Err(_) => return Stage::init_random_colors(),
+        };
+
+        let expected_len = (3 * MAX_PARTICLES) as u64;
+        let len = match file.metadata() {
+            Ok(meta) => meta.len(),
+            Err(_) => return Stage::init_random_colors(),
+        };
+        if len != expected_len {
+            println!(
+                "colors.txt file is meant for {} particles, generating random colors",
+                len / 3
+            );
+            return Stage::init_random_colors();
         }
+
+        let mut data: Vec<u8> = Vec::with_capacity(expected_len as usize);
+        file.read_to_end(&mut data).unwrap();
+        data.chunks(3)
+            .map(|col| vec3(col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0))
+            .collect()
     }
 
     fn init_random_colors() -> Vec<Vec3> {
@@ -186,7 +189,7 @@ impl Stage {
 
 impl EventHandler for Stage {
     fn update(&mut self) {
-        match self.can_update {
+        match self.update_mode {
             UpdateCommand::Stop => return,
             UpdateCommand::Quit => {
                 window::quit();
@@ -210,19 +213,19 @@ impl EventHandler for Stage {
 
         self.frame_count += 1;
         self.accumulate_time += self.last_frame.elapsed().as_micros();
-        if self.frame_count % 30 == 0 {
+        if self.frame_count.is_multiple_of(30) {
             println!(
                 "objects: {}, fps: {}, time to update: {}",
                 self.physics.nb_particles(),
-                1000000 / (self.accumulate_time / 30),
+                1_000_000 / (self.accumulate_time / 30),
                 start.elapsed().as_micros()
             );
             self.accumulate_time = 0;
         }
         self.last_frame = Instant::now();
 
-        if let UpdateCommand::OneFrame = self.can_update {
-            self.can_update = UpdateCommand::Stop;
+        if let UpdateCommand::OneFrame = self.update_mode {
+            self.update_mode = UpdateCommand::Stop;
         }
     }
 
@@ -318,10 +321,11 @@ impl EventHandler for Stage {
                     .iter()
                     .take(nb)
                     .map(|p| {
-                        p.clamp(
-                            vec3(100.0 + p.z, 100.0 + p.z, p.z),
-                            vec3(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z, p.z),
-                        )
+                        let xy = p.xy().clamp(
+                            vec2(100.0 + p.z, 100.0 + p.z),
+                            vec2(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z),
+                        );
+                        xy.extend(p.z)
                     })
                     .collect();
 
@@ -348,14 +352,15 @@ impl EventHandler for Stage {
 
                 println!("loaded image");
             }
-            KeyCode::N => self.can_update = UpdateCommand::OneFrame,
+            KeyCode::N => self.update_mode = UpdateCommand::OneFrame,
             KeyCode::Space => {
-                self.can_update = match self.can_update {
+                self.update_mode = match self.update_mode {
                     UpdateCommand::Continue => UpdateCommand::Stop,
-                    _ => UpdateCommand::Continue,
-                }
+                    UpdateCommand::Stop => UpdateCommand::Continue,
+                    other => other,
+                };
             }
-            KeyCode::Escape => self.can_update = UpdateCommand::Quit,
+            KeyCode::Escape => self.update_mode = UpdateCommand::Quit,
             _ => (),
         }
     }

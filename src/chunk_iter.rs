@@ -1,20 +1,16 @@
-use std::marker::PhantomData;
-
 pub struct ChunksMutIndices<'a, T: 'a> {
-    v: *mut [T],
+    v: Option<&'a mut [T]>,
     breakpoints: &'a [usize],
     curr_ind: usize,
-    _marker: PhantomData<&'a mut T>,
 }
 
 impl<'a, T: 'a + Sync> ChunksMutIndices<'a, T> {
     #[inline]
     pub fn new(slice: &'a mut [T], breakpoints: &'a [usize]) -> Self {
         Self {
-            v: slice,
+            v: Some(slice),
             breakpoints,
             curr_ind: 0,
-            _marker: PhantomData,
         }
     }
 }
@@ -24,22 +20,19 @@ impl<'a, T> Iterator for ChunksMutIndices<'a, T> {
 
     #[inline]
     fn next(&mut self) -> Option<(&'a mut [T], usize)> {
-        if self.v.is_empty() || self.curr_ind >= self.breakpoints.len() {
+        if self.curr_ind >= self.breakpoints.len() {
             None
         } else {
+            let v = self.v.take()?;
             let siz = if self.curr_ind < self.breakpoints.len() - 1 {
                 self.breakpoints[self.curr_ind + 1] - self.breakpoints[self.curr_ind]
             } else {
-                self.v.len()
+                v.len()
             };
+            let (head, tail) = v.split_at_mut(siz);
+            self.v = Some(tail);
             self.curr_ind += 1;
-            // SAFETY: The self.v contract ensures that any split_at_mut is valid.
-            let (head, tail) = unsafe { self.v.split_at_mut(siz) };
-            self.v = tail;
-            // SAFETY: Nothing else points to or will point to the contents of this slice.
-            Some(unsafe { (&mut *head, self.breakpoints[self.curr_ind - 1]) })
+            Some((head, self.breakpoints[self.curr_ind - 1]))
         }
     }
 }
-
-unsafe impl<'a, T> Send for ChunksMutIndices<'a, T> {}

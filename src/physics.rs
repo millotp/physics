@@ -10,8 +10,11 @@ const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
 const BIN_H: usize = HEIGHT / BIN_SIZE;
 const NUM_BIN: usize = BIN_W * BIN_H;
+const BORDER_PADDING: f32 = 100.0;
+const OBSTACLE_POS: Vec2 = vec2(850.0, 600.0);
+const OBSTACLE_PADDING: f32 = 100.0;
 
-const _: () = assert!((WIDTH / BIN_SIZE) % NB_THREAD == 0);
+const _: () = assert!((WIDTH / BIN_SIZE).is_multiple_of(NB_THREAD));
 const _: () = assert!(MAX_RADIUS * 2.0 <= BIN_SIZE as f32);
 
 pub struct Bin {
@@ -66,36 +69,35 @@ impl Physics {
 
     fn apply_constraint(&mut self) {
         let factor = 0.75;
-        //let center = vec2(WIDTH as f32 / 2.0, HEIGHT as f32 / 2.00);
         for i in 0..self.len {
-            /*let diff = center - self.pos[i];
-            let len = diff.length();
-            if len > 400.0 - self.radii[i] {
-                let n = diff / len;
-                self.pos[i] = center - n * (400.0 - self.radii[i]);
-            }*/
+            self.apply_obstacle_constraint(i);
 
-            let v = self.pos[i].xy() - vec2(850.0, 600.0);
-            let dist2 = v.length_squared();
-            let min_dist = self.pos[i].z + 100.0;
-            if dist2 < min_dist * min_dist {
-                let dist = dist2.sqrt();
-                let n = v / dist;
-                self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
+            if self.pos[i].x > WIDTH as f32 - BORDER_PADDING - self.pos[i].z {
+                self.pos[i].x += factor
+                    * (WIDTH as f32 - BORDER_PADDING - self.pos[i].z - self.pos[i].x);
             }
+            if self.pos[i].x < BORDER_PADDING + self.pos[i].z {
+                self.pos[i].x += factor * (BORDER_PADDING + self.pos[i].z - self.pos[i].x);
+            }
+            if self.pos[i].y > HEIGHT as f32 - BORDER_PADDING - self.pos[i].z {
+                self.pos[i].y += factor
+                    * (HEIGHT as f32 - BORDER_PADDING - self.pos[i].z - self.pos[i].y);
+            }
+            if self.pos[i].y < BORDER_PADDING + self.pos[i].z {
+                self.pos[i].y += factor * (BORDER_PADDING + self.pos[i].z - self.pos[i].y);
+            }
+        }
+    }
 
-            if self.pos[i].x > WIDTH as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].x += factor * (WIDTH as f32 - 100.0 - self.pos[i].z - self.pos[i].x);
-            }
-            if self.pos[i].x < 100.0 + self.pos[i].z {
-                self.pos[i].x += factor * (100.0 + self.pos[i].z - self.pos[i].x);
-            }
-            if self.pos[i].y > HEIGHT as f32 - 100.0 - self.pos[i].z {
-                self.pos[i].y += factor * (HEIGHT as f32 - 100.0 - self.pos[i].z - self.pos[i].y);
-            }
-            if self.pos[i].y < 100.0 + self.pos[i].z {
-                self.pos[i].y += factor * (100.0 + self.pos[i].z - self.pos[i].y);
-            }
+    #[inline]
+    fn apply_obstacle_constraint(&mut self, i: usize) {
+        let v = self.pos[i].xy() - OBSTACLE_POS;
+        let dist2 = v.length_squared();
+        let min_dist = self.pos[i].z + OBSTACLE_PADDING;
+        if dist2 < min_dist * min_dist {
+            let dist = dist2.sqrt();
+            let n = v / dist;
+            self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
         }
     }
 
@@ -153,8 +155,7 @@ impl Physics {
                 let bin_y = bin1 % BIN_H;
                 if bin_x < start_x + wall
                     || bin_x >= (start_x + width) - wall
-                    || bin_y < 1
-                    || bin_y >= BIN_H - 1
+                    || !(1..BIN_H - 1).contains(&bin_y)
                 {
                     continue;
                 }
@@ -210,28 +211,27 @@ impl Physics {
                 )
             });
 
-        let breakpoints_borders = self
-            .bin_start
-            .iter()
-            .skip(chunk_size / 2)
-            .take(NUM_BIN - chunk_size)
-            .step_by(chunk_size)
-            .copied()
-            .collect::<Vec<usize>>();
-
-        // check collisions across thread borders
-        ChunksMutIndices::new(&mut self.sorted_pos, &breakpoints_borders)
-            .enumerate()
-            .par_bridge()
-            .for_each(|(slice_i, (slice_pos, breakpoint))| {
-                check_slice(
-                    slice_pos,
-                    breakpoint,
-                    (slice_i + 1) * thread_width - 1,
-                    2,
-                    0,
-                )
-            });
+        // Strips for bin1 in columns (start_x, start_x+1) need 3x3 in column range
+        // (start_x-1)..=(start_x+2) => bins [ (start_x-1)*BIN_H, (start_x+3)*BIN_H ).
+        // The old `skip(chunk_size/2) + ChunksMutIndices` misaligned: offset started at
+        // bin 1200 while neighbors could be in 1920+ — `i2 - offset` underflowed and
+        // `get_unchecked` read garbage (spurious bounces at inter-thread x boundaries).
+        for slice_i in 0..(NB_THREAD - 1) {
+            let start_x = (slice_i + 1) * thread_width - 1;
+            let col_lo = start_x.saturating_sub(1);
+            let bin_lo = col_lo * BIN_H;
+            let bin_hi = (start_x + 3) * BIN_H;
+            if bin_hi > NUM_BIN {
+                continue;
+            }
+            let a = self.bin_start[bin_lo];
+            let b = self.bin_start[bin_hi];
+            if a < b {
+                let slice = &mut self.sorted_pos[a..b];
+                let offset = a;
+                check_slice(slice, offset, start_x, 2, 0);
+            }
+        }
 
         for sp in self.sorted_pos.iter().take(self.len) {
             self.pos[sp.1] = sp.0;

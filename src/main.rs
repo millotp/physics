@@ -392,6 +392,11 @@ impl EventHandler for Stage {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--bench") {
+        run_bench(&args);
+        return;
+    }
     miniquad::start(
         conf::Conf {
             window_width: WIDTH as i32,
@@ -400,5 +405,85 @@ fn main() {
             ..Default::default()
         },
         || Box::new(Stage::new()),
+    );
+}
+
+/// Headless benchmark. Mirrors `Stage::update` exactly: `emit_flow` once per frame,
+/// `step(dt/10.0)` ten times, with `dt = 1/60`. Deterministic via `quad_rand::srand`.
+///
+/// Budget is ~5 s wall-clock with defaults (28k particles). Override with CLI args.
+///
+/// Usage:
+///   physics --bench [frames=100] [warmup=500] [seed=1]
+fn run_bench(args: &[String]) {
+    fn parse_or<T: std::str::FromStr>(s: Option<&String>, d: T) -> T {
+        s.and_then(|v| v.parse().ok()).unwrap_or(d)
+    }
+    let positional: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--bench").collect();
+    let frames: usize = parse_or(positional.first().copied(), 100usize);
+    let warmup: usize = parse_or(positional.get(1).copied(), 500usize);
+    let seed: u64 = parse_or(positional.get(2).copied(), 1u64);
+
+    quad_rand::srand(seed);
+    let mut physics = Physics::new();
+    let dt: f32 = 1.0 / 60.0;
+
+    for _ in 0..warmup {
+        physics.emit_flow();
+        for _ in 0..10 {
+            physics.step(dt / 10.0);
+        }
+    }
+
+    // Reset timers after warmup so only the measured window counts.
+    physics::reset_breakdown();
+
+    let mut samples: Vec<u128> = Vec::with_capacity(frames);
+    let total_start = Instant::now();
+    for _ in 0..frames {
+        let t = Instant::now();
+        physics.emit_flow();
+        for _ in 0..10 {
+            physics.step(dt / 10.0);
+        }
+        samples.push(t.elapsed().as_micros());
+    }
+    let total = total_start.elapsed().as_micros();
+
+    samples.sort_unstable();
+    let n = samples.len().max(1);
+    let p = |q: f64| samples[(q * (n - 1) as f64).round() as usize];
+    let min = samples[0];
+    let median = p(0.50);
+    let p95 = p(0.95);
+    let p99 = p(0.99);
+    let max = *samples.last().unwrap();
+    let mean: u128 = samples.iter().sum::<u128>() / n as u128;
+
+    eprintln!(
+        "bench: particles_end={} frames={} warmup={} seed={}",
+        physics.nb_particles(),
+        frames,
+        warmup,
+        seed
+    );
+    eprintln!(
+        "       per-frame us: min={min} median={median} mean={mean} p95={p95} p99={p99} max={max}"
+    );
+    eprintln!(
+        "       total_ms={:.2} fps_avg={:.1}",
+        total as f64 / 1000.0,
+        frames as f64 * 1_000_000.0 / total as f64
+    );
+    if std::env::var("BENCH_BREAKDOWN").is_ok() {
+        physics::print_breakdown(frames * 10);
+    }
+    // One-line machine-readable summary on stdout:
+    println!(
+        "particles_end={} frames={} min={min} median={median} mean={mean} p95={p95} p99={p99} max={max} total_ms={:.2} fps_avg={:.1}",
+        physics.nb_particles(),
+        frames,
+        total as f64 / 1000.0,
+        frames as f64 * 1_000_000.0 / total as f64
     );
 }

@@ -6,11 +6,11 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-glam = "0.22.0"
-image = "0.24.5"
-miniquad = "0.3.15"
-quad-rand = "0.2.1"
-rayon = "1.6.1"
+glam = "0.32.1"
+image = "0.25.10"
+miniquad = "0.4.8"
+quad-rand = "0.2.3"
+rayon = "1.12.0"
 
 [profile.release]
 debug = true

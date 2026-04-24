@@ -1,4 +1,3 @@
-#![feature(slice_ptr_len)]
 #![feature(raw_slice_split)]
 
 use std::{
@@ -14,7 +13,7 @@ mod shader;
 
 use miniquad::*;
 
-use image::io::Reader as ImageReader;
+use image::ImageReader;
 
 use glam::{vec2, vec3, Mat4, Vec2, Vec3};
 use physics::{Physics, BIN_W, MAX_PARTICLES, NB_THREAD};
@@ -31,6 +30,7 @@ enum UpdateCommand {
 }
 
 struct Stage {
+    ctx: Box<dyn RenderingBackend>,
     pipeline: Pipeline,
     bindings: Bindings,
 
@@ -45,7 +45,9 @@ struct Stage {
 }
 
 impl Stage {
-    pub fn new(ctx: &mut Context) -> Stage {
+    pub fn new() -> Stage {
+        let mut ctx: Box<dyn RenderingBackend> = window::new_rendering_backend();
+
         quad_rand::srand(1);
 
         let mut vertices = vec![0f32; (CIRCLE_SIDES + 1) * 2];
@@ -55,24 +57,34 @@ impl Stage {
             vertices[i * 2 + 3] = angle.sin();
         }
 
-        // vertex buffer for static geometry
-        let geometry_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &vertices);
+        let geometry_vertex_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&vertices),
+        );
 
         let indices = (0..CIRCLE_SIDES)
             .flat_map(|i| [0, i as u16 + 1, ((i + 1) % CIRCLE_SIDES + 1) as u16])
             .collect::<Vec<u16>>();
-        let index_buffer = Buffer::immutable(ctx, BufferType::IndexBuffer, &indices);
+        let index_buffer = ctx.new_buffer(
+            BufferType::IndexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&indices),
+        );
 
         let physics = Physics::new();
 
         let colors = Stage::init_colors();
-        let colors_vertex_buffer = Buffer::immutable(ctx, BufferType::VertexBuffer, &colors);
-
-        // empty, dynamic instance-data vertex buffer
-        let positions_vertex_buffer = Buffer::stream(
-            ctx,
+        let colors_vertex_buffer = ctx.new_buffer(
             BufferType::VertexBuffer,
-            MAX_PARTICLES * std::mem::size_of::<Vec3>(),
+            BufferUsage::Immutable,
+            BufferSource::slice(&colors),
+        );
+
+        let positions_vertex_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Stream,
+            BufferSource::empty::<Vec3>(MAX_PARTICLES),
         );
 
         let bindings = Bindings {
@@ -85,10 +97,17 @@ impl Stage {
             images: vec![],
         };
 
-        let shader = Shader::new(ctx, shader::VERTEX, shader::FRAGMENT, shader::meta()).unwrap();
+        let shader = ctx
+            .new_shader(
+                ShaderSource::Glsl {
+                    vertex: shader::VERTEX,
+                    fragment: shader::FRAGMENT,
+                },
+                shader::meta(),
+            )
+            .unwrap();
 
-        let pipeline = Pipeline::new(
-            ctx,
+        let pipeline = ctx.new_pipeline(
             &[
                 BufferLayout::default(),
                 BufferLayout {
@@ -106,9 +125,11 @@ impl Stage {
                 VertexAttribute::with_buffer("color0", VertexFormat::Float3, 2),
             ],
             shader,
+            PipelineParams::default(),
         );
 
         Stage {
+            ctx,
             pipeline,
             bindings,
             physics,
@@ -164,11 +185,11 @@ impl Stage {
 }
 
 impl EventHandler for Stage {
-    fn update(&mut self, ctx: &mut Context) {
+    fn update(&mut self) {
         match self.can_update {
             UpdateCommand::Stop => return,
             UpdateCommand::Quit => {
-                ctx.quit();
+                window::quit();
                 return;
             }
             _ => (),
@@ -179,7 +200,6 @@ impl EventHandler for Stage {
 
         self.physics.emit_flow();
 
-        // update particle positions
         for _ in 0..10 {
             self.physics.step(dt / 10.0);
         }
@@ -206,26 +226,26 @@ impl EventHandler for Stage {
         }
     }
 
-    fn mouse_motion_event(&mut self, _ctx: &mut Context, x: f32, y: f32) {
+    fn mouse_motion_event(&mut self, x: f32, y: f32) {
         if self.mouse_pressed {
             self.mouse_pos = vec2(x, y);
         }
     }
 
-    fn mouse_button_down_event(&mut self, _: &mut Context, button: MouseButton, x: f32, y: f32) {
+    fn mouse_button_down_event(&mut self, button: MouseButton, x: f32, y: f32) {
         if button == MouseButton::Left {
             self.mouse_pos = vec2(x, y);
             self.mouse_pressed = true;
         }
     }
 
-    fn mouse_button_up_event(&mut self, _: &mut Context, button: MouseButton, _: f32, _: f32) {
+    fn mouse_button_up_event(&mut self, button: MouseButton, _: f32, _: f32) {
         if button == MouseButton::Left {
             self.mouse_pressed = false;
         }
     }
 
-    fn key_down_event(&mut self, ctx: &mut Context, keycode: KeyCode, _: KeyMods, _: bool) {
+    fn key_down_event(&mut self, keycode: KeyCode, _: KeyMods, _: bool) {
         let random_color = || {
             vec3(
                 quad_rand::gen_range(0.0, 1.0),
@@ -247,8 +267,11 @@ impl EventHandler for Stage {
                     }
                 }
 
-                let colors_vertex_buffer =
-                    Buffer::immutable(ctx, BufferType::VertexBuffer, &self.colors);
+                let colors_vertex_buffer = self.ctx.new_buffer(
+                    BufferType::VertexBuffer,
+                    BufferUsage::Immutable,
+                    BufferSource::slice(&self.colors),
+                );
                 self.bindings.vertex_buffers[2] = colors_vertex_buffer;
             }
             KeyCode::T => {
@@ -263,8 +286,11 @@ impl EventHandler for Stage {
                     }
                 }
 
-                let colors_vertex_buffer =
-                    Buffer::immutable(ctx, BufferType::VertexBuffer, &self.colors);
+                let colors_vertex_buffer = self.ctx.new_buffer(
+                    BufferType::VertexBuffer,
+                    BufferUsage::Immutable,
+                    BufferSource::slice(&self.colors),
+                );
                 self.bindings.vertex_buffers[2] = colors_vertex_buffer;
             }
             KeyCode::S => {
@@ -285,24 +311,26 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
-                for (i, point) in self
+                let nb = self.physics.nb_particles();
+                let points: Vec<Vec3> = self
                     .physics
                     .get_points()
                     .iter()
-                    .take(self.physics.nb_particles())
+                    .take(nb)
                     .map(|p| {
                         p.clamp(
                             vec3(100.0 + p.z, 100.0 + p.z, p.z),
                             vec3(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z, p.z),
                         )
                     })
-                    .enumerate()
-                {
+                    .collect();
+
+                for (i, point) in points.iter().enumerate() {
                     self.colors[i] = match point.y < 400.0 {
                         true => Vec3::ONE,
                         false => {
-                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32 * img.width() as f32)
-                                as u32;
+                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32
+                                * img.width() as f32) as u32;
                             let y = ((point.y - 400.0) / (HEIGHT - 500) as f32
                                 * img.height() as f32) as u32;
                             let pixel = img.get_pixel(x, y);
@@ -310,8 +338,12 @@ impl EventHandler for Stage {
                         }
                     }
                 }
-                let colors_vertex_buffer =
-                    Buffer::immutable(ctx, BufferType::VertexBuffer, &self.colors);
+
+                let colors_vertex_buffer = self.ctx.new_buffer(
+                    BufferType::VertexBuffer,
+                    BufferUsage::Immutable,
+                    BufferSource::slice(&self.colors),
+                );
                 self.bindings.vertex_buffers[2] = colors_vertex_buffer;
 
                 println!("loaded image");
@@ -328,24 +360,29 @@ impl EventHandler for Stage {
         }
     }
 
-    fn draw(&mut self, ctx: &mut Context) {
-        self.bindings.vertex_buffers[1].update(ctx, self.physics.get_points());
+    fn draw(&mut self) {
+        let points = self.physics.get_points().to_vec();
+        self.ctx.buffer_update(
+            self.bindings.vertex_buffers[1],
+            BufferSource::slice(&points),
+        );
 
         let proj = Mat4::orthographic_lh(0.0, WIDTH as f32, HEIGHT as f32, 0.0, 0.0, 1.0);
 
-        ctx.begin_default_pass(Default::default());
+        self.ctx.begin_default_pass(Default::default());
 
-        ctx.apply_pipeline(&self.pipeline);
-        ctx.apply_bindings(&self.bindings);
-        ctx.apply_uniforms(&shader::Uniforms { mvp: proj });
-        ctx.draw(
+        self.ctx.apply_pipeline(&self.pipeline);
+        self.ctx.apply_bindings(&self.bindings);
+        self.ctx
+            .apply_uniforms(UniformsSource::table(&shader::Uniforms { mvp: proj }));
+        self.ctx.draw(
             0,
             (CIRCLE_SIDES * 3) as i32,
             self.physics.nb_particles() as i32,
         );
-        ctx.end_render_pass();
+        self.ctx.end_render_pass();
 
-        ctx.commit_frame();
+        self.ctx.commit_frame();
     }
 }
 
@@ -357,6 +394,6 @@ fn main() {
             high_dpi: false,
             ..Default::default()
         },
-        |ctx| Box::new(Stage::new(ctx)),
+        || Box::new(Stage::new()),
     );
 }

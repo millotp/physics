@@ -5,6 +5,8 @@ use std::{
     time::Instant,
 };
 
+mod emit;
+mod obstacles;
 mod physics;
 mod shader;
 
@@ -13,9 +15,15 @@ use miniquad::*;
 use image::ImageReader;
 
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
+use obstacles::RectInstance;
 use physics::{Physics, BIN_W, BORDER_PADDING, MAX_PARTICLES, NB_THREAD};
 
 const CIRCLE_SIDES: usize = 12;
+/// Higher tessellation for obstacles only — there are at most a few hundred
+/// of them on screen, so vertex count is negligible compared to the per-particle
+/// path. Particles stay at `CIRCLE_SIDES` so their per-instance vertex shading
+/// cost is unaffected.
+const OBSTACLE_CIRCLE_SIDES: usize = 64;
 /// Logical simulation world size, in physics units. The bin grid, particle
 /// coordinates and ortho projection all use these values.
 const WIDTH: usize = 1200;
@@ -33,20 +41,29 @@ enum UpdateCommand {
     Quit,
 }
 
-/// Soft cap on the number of discs needed to draw any obstacle scene
-/// (capsules expand into a small chain of overlapping circles). Way more
-/// than the busiest current scene needs.
+/// Soft cap on the number of circle obstacles in any scene. Way more than
+/// the busiest current scene needs.
 const MAX_OBSTACLE_DISCS: usize = 256;
+/// Soft cap on oriented-rect obstacles per scene.
+const MAX_OBSTACLE_RECTS: usize = 64;
 
 struct Stage {
     ctx: Box<dyn RenderingBackend>,
     pipeline: Pipeline,
     bindings: Bindings,
-    /// Bindings reused for the obstacle draw call: same circle geometry +
-    /// index buffer, but the per-instance buffers are dedicated to obstacles.
+    /// Bindings reused for the circle-obstacle draw call: 64-side circle
+    /// geometry plus a streaming per-instance pos buffer.
     obstacle_bindings: Bindings,
-    /// Streaming buffer for obstacle (center.xy, radius) packed as `Vec3`.
+    /// Streaming buffer for circle obstacle (center.xy, radius) packed as
+    /// `Vec3`.
     obstacle_pos_buffer: BufferId,
+    /// Pipeline + bindings for oriented rectangles (e.g. rotating bars).
+    /// Separate from `pipeline` because the vertex shader takes a different
+    /// per-instance layout (center, axis, half_extents).
+    rect_pipeline: Pipeline,
+    rect_bindings: Bindings,
+    /// Streaming per-instance buffer for `obstacles::RectInstance`.
+    rect_inst_buffer: BufferId,
 
     physics: Physics,
     colors: Vec<Vec3>,
@@ -64,27 +81,9 @@ impl Stage {
 
         quad_rand::srand(1);
 
-        let mut vertices = vec![0f32; (CIRCLE_SIDES + 1) * 2];
-        for i in 0..CIRCLE_SIDES {
-            let angle = i as f32 * (2f32 * PI) / CIRCLE_SIDES as f32;
-            vertices[i * 2 + 2] = angle.cos();
-            vertices[i * 2 + 3] = angle.sin();
-        }
-
-        let geometry_vertex_buffer = ctx.new_buffer(
-            BufferType::VertexBuffer,
-            BufferUsage::Immutable,
-            BufferSource::slice(&vertices),
-        );
-
-        let indices = (0..CIRCLE_SIDES)
-            .flat_map(|i| [0, i as u16 + 1, ((i + 1) % CIRCLE_SIDES + 1) as u16])
-            .collect::<Vec<u16>>();
-        let index_buffer = ctx.new_buffer(
-            BufferType::IndexBuffer,
-            BufferUsage::Immutable,
-            BufferSource::slice(&indices),
-        );
+        let (geometry_vertex_buffer, index_buffer) = make_circle_geometry(&mut *ctx, CIRCLE_SIDES);
+        let (obstacle_geometry_vertex_buffer, obstacle_index_buffer) =
+            make_circle_geometry(&mut *ctx, OBSTACLE_CIRCLE_SIDES);
 
         let physics = Physics::new();
 
@@ -130,11 +129,11 @@ impl Stage {
         );
         let obstacle_bindings = Bindings {
             vertex_buffers: vec![
-                geometry_vertex_buffer,
+                obstacle_geometry_vertex_buffer,
                 obstacle_pos_buffer,
                 obstacle_color_buffer,
             ],
-            index_buffer,
+            index_buffer: obstacle_index_buffer,
             images: vec![],
         };
 
@@ -169,12 +168,82 @@ impl Stage {
             PipelineParams::default(),
         );
 
+        // --- Oriented-rect pipeline (rotating bars / boxes) ---------------
+        // Unit rectangle from (-1,-1) to (+1,+1). The vertex shader scales
+        // it into world space using per-instance (center, axis, half_extents).
+        let rect_unit_vertices: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, 1.0, 1.0, -1.0, 1.0];
+        let rect_unit_indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
+        let rect_geometry_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&rect_unit_vertices),
+        );
+        let rect_index_buffer = ctx.new_buffer(
+            BufferType::IndexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&rect_unit_indices),
+        );
+        let rect_inst_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Stream,
+            BufferSource::empty::<RectInstance>(MAX_OBSTACLE_RECTS),
+        );
+        let rect_colors: Vec<Vec3> = (0..MAX_OBSTACLE_RECTS)
+            .map(|_| vec3(0.35, 0.35, 0.40))
+            .collect();
+        let rect_color_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&rect_colors),
+        );
+        let rect_bindings = Bindings {
+            vertex_buffers: vec![rect_geometry_buffer, rect_inst_buffer, rect_color_buffer],
+            index_buffer: rect_index_buffer,
+            images: vec![],
+        };
+
+        let rect_shader = ctx
+            .new_shader(
+                ShaderSource::Glsl {
+                    vertex: shader::VERTEX_RECT,
+                    fragment: shader::FRAGMENT,
+                },
+                shader::meta(),
+            )
+            .unwrap();
+
+        let rect_pipeline = ctx.new_pipeline(
+            &[
+                BufferLayout::default(),
+                BufferLayout {
+                    step_func: VertexStep::PerInstance,
+                    ..Default::default()
+                },
+                BufferLayout {
+                    step_func: VertexStep::PerInstance,
+                    ..Default::default()
+                },
+            ],
+            &[
+                VertexAttribute::with_buffer("pos", VertexFormat::Float2, 0),
+                VertexAttribute::with_buffer("inst_center", VertexFormat::Float2, 1),
+                VertexAttribute::with_buffer("inst_axis", VertexFormat::Float2, 1),
+                VertexAttribute::with_buffer("inst_half", VertexFormat::Float2, 1),
+                VertexAttribute::with_buffer("color0", VertexFormat::Float3, 2),
+            ],
+            rect_shader,
+            PipelineParams::default(),
+        );
+
         Stage {
             ctx,
             pipeline,
             bindings,
             obstacle_bindings,
             obstacle_pos_buffer,
+            rect_pipeline,
+            rect_bindings,
+            rect_inst_buffer,
             physics,
             colors,
             last_frame: Instant::now(),
@@ -229,6 +298,32 @@ impl Stage {
             })
             .collect()
     }
+}
+
+/// Build the unit-circle fan geometry + index buffer used by every disc draw.
+/// `sides` controls tessellation; the same fan is instanced per particle or
+/// per obstacle, scaled by `pos_radius.z` in the vertex shader.
+fn make_circle_geometry(ctx: &mut dyn RenderingBackend, sides: usize) -> (BufferId, BufferId) {
+    let mut vertices = vec![0f32; (sides + 1) * 2];
+    for i in 0..sides {
+        let angle = i as f32 * (2f32 * PI) / sides as f32;
+        vertices[i * 2 + 2] = angle.cos();
+        vertices[i * 2 + 3] = angle.sin();
+    }
+    let vb = ctx.new_buffer(
+        BufferType::VertexBuffer,
+        BufferUsage::Immutable,
+        BufferSource::slice(&vertices),
+    );
+    let indices: Vec<u16> = (0..sides)
+        .flat_map(|i| [0, i as u16 + 1, ((i + 1) % sides + 1) as u16])
+        .collect();
+    let ib = ctx.new_buffer(
+        BufferType::IndexBuffer,
+        BufferUsage::Immutable,
+        BufferSource::slice(&indices),
+    );
+    (vb, ib)
 }
 
 impl EventHandler for Stage {
@@ -426,12 +521,21 @@ impl EventHandler for Stage {
             BufferSource::slice(self.physics.active_points()),
         );
 
-        let obstacle_discs = self.physics.obstacle_discs();
-        let obstacle_count = obstacle_discs.len().min(MAX_OBSTACLE_DISCS);
-        if obstacle_count > 0 {
+        let obstacle_circles = self.physics.obstacle_circles();
+        let circle_count = obstacle_circles.len().min(MAX_OBSTACLE_DISCS);
+        if circle_count > 0 {
             self.ctx.buffer_update(
                 self.obstacle_pos_buffer,
-                BufferSource::slice(&obstacle_discs[..obstacle_count]),
+                BufferSource::slice(&obstacle_circles[..circle_count]),
+            );
+        }
+
+        let obstacle_rects = self.physics.obstacle_rects();
+        let rect_count = obstacle_rects.len().min(MAX_OBSTACLE_RECTS);
+        if rect_count > 0 {
+            self.ctx.buffer_update(
+                self.rect_inst_buffer,
+                BufferSource::slice(&obstacle_rects[..rect_count]),
             );
         }
 
@@ -449,17 +553,29 @@ impl EventHandler for Stage {
 
         self.ctx.begin_default_pass(Default::default());
 
+        // Circle obstacles first so particles (and rects) render on top.
+        if circle_count > 0 {
+            self.ctx.apply_pipeline(&self.pipeline);
+            self.ctx
+                .apply_uniforms(UniformsSource::table(&shader::Uniforms { mvp: proj }));
+            self.ctx.apply_bindings(&self.obstacle_bindings);
+            self.ctx
+                .draw(0, (OBSTACLE_CIRCLE_SIDES * 3) as i32, circle_count as i32);
+        }
+
+        // Rect obstacles next, sharing the same depth as circle obstacles.
+        if rect_count > 0 {
+            self.ctx.apply_pipeline(&self.rect_pipeline);
+            self.ctx
+                .apply_uniforms(UniformsSource::table(&shader::Uniforms { mvp: proj }));
+            self.ctx.apply_bindings(&self.rect_bindings);
+            self.ctx.draw(0, 6, rect_count as i32);
+        }
+
+        // Particles on top.
         self.ctx.apply_pipeline(&self.pipeline);
         self.ctx
             .apply_uniforms(UniformsSource::table(&shader::Uniforms { mvp: proj }));
-
-        // Obstacles first so particles render on top of them.
-        if obstacle_count > 0 {
-            self.ctx.apply_bindings(&self.obstacle_bindings);
-            self.ctx
-                .draw(0, (CIRCLE_SIDES * 3) as i32, obstacle_count as i32);
-        }
-
         self.ctx.apply_bindings(&self.bindings);
         self.ctx.draw(
             0,
@@ -476,6 +592,10 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--bench") {
         run_bench(&args);
+        return;
+    }
+    if args.iter().any(|a| a == "--gui-sig") {
+        run_gui_sig(&args);
         return;
     }
     miniquad::start(

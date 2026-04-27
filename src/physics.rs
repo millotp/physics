@@ -1,9 +1,13 @@
-use glam::{vec2, Vec2, Vec3, Vec3Swizzles};
+use glam::{Vec2, Vec3, Vec3Swizzles};
 use rayon::prelude::*;
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
 
+use crate::emit::{self, EMIT_BATCHES_PER_SEC};
+use crate::obstacles::{
+    self, build as build_obstacles, scene_is_animated, Obstacle, OBSTACLE_SCENE,
+};
 use crate::{HEIGHT, WIDTH};
 
 /// Per-stage microsecond accumulators. Always recorded; `print_breakdown`
@@ -41,88 +45,24 @@ pub fn print_breakdown(frames: usize) {
 }
 
 pub const MAX_PARTICLES: usize = 70000;
-const MAX_RADIUS: f32 = 2.5;
+pub(crate) const MAX_RADIUS: f32 = 2.5;
 pub const NB_THREAD: usize = 8;
-const BIN_SIZE: usize = 5;
+pub(crate) const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
-const BIN_H: usize = HEIGHT / BIN_SIZE;
-const NUM_BIN: usize = BIN_W * BIN_H;
+pub(crate) const BIN_H: usize = HEIGHT / BIN_SIZE;
+pub(crate) const NUM_BIN: usize = BIN_W * BIN_H;
 /// Inner-border thickness in world units. The wall constraint and pair
 /// collision response need a non-zero buffer so particles can resolve
 /// overlaps in 2D near walls instead of collapsing into a 1D line. The
 /// renderer hides this buffer by zooming the camera to the playable area.
 pub const BORDER_PADDING: f32 = 15.0;
 
-/// Active scenes. Pick a combination by changing these two consts.
-pub const EMIT_SCENE: EmitScene = EmitScene::TwoCrossing;
-pub const OBSTACLE_SCENE: ObstacleScene = ObstacleScene::Pachinko;
-
-/// How particles are spawned each `emit_flow` call.
-#[allow(dead_code, reason = "variants are scene options selected via EMIT_SCENE")]
-#[derive(Copy, Clone, Debug)]
-pub enum EmitScene {
-    /// Original: one diagonal stream from `(200, 200)`.
-    Single,
-    /// Two streams crossing in mid-air, one from each top corner.
-    TwoCrossing,
-    /// Single emitter, fan of velocities (cone of directions).
-    Fountain,
-    /// Big bursts every ~1 s instead of a constant trickle.
-    Pulse,
-    /// A long horizontal strip across the top, particles fall straight down.
-    Rain,
-    /// Curated mix: rain + a sweeping fountain, picked for visual impact.
-    YouDecide,
-}
-
-/// What static / animated obstacles populate the playfield.
-#[allow(
-    dead_code,
-    reason = "variants are scene options selected via OBSTACLE_SCENE"
-)]
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum ObstacleScene {
-    /// Original: one big circular bumper at `(850, 600)`.
-    Single,
-    /// Pachinko: 5 rows of pegs in a triangle pattern.
-    Pachinko,
-    /// A long oblong (capsule) sweeping around the centre.
-    RotatingBar,
-    /// Ring of pegs around the centre.
-    Ring,
-    /// Three big circles at distinctive positions.
-    FewCircles,
-    /// Curated mix: a small pachinko on top of two rotating bars below.
-    YouDecide,
-}
-
-/// Static and animated colliders. Capsule is a swept circle of radius `r`
-/// between endpoints `a` and `b` — closest-point-on-segment is cheap and
-/// covers oblong bars.
-#[derive(Copy, Clone, Debug)]
-enum Obstacle {
-    Circle { center: Vec2, radius: f32 },
-    Capsule { a: Vec2, b: Vec2, radius: f32 },
-}
-
-/// Per-step angular velocity for the rotating bar variants (rad / sim-second).
-/// Stays deterministic since it's tied to the physics step count, not
-/// wall-clock time.
-const BAR_ANGULAR_VEL: f32 = 0.6;
-
-/// Default emission rate, in flow-batches per second (one batch = 48 particles,
-/// see `emit_flow`). 60/s matches the historical "one emit per 1/60 s frame"
-/// tuning the rest of the params are calibrated for.
-const EMIT_BATCHES_PER_SEC: f32 = 60.0;
-
 /// Gravity acceleration in world units / s². Small X gives the flow a slight
 /// horizontal drift; Y dominates.
-const GRAVITY: Vec2 = vec2(10.0, 200.0);
+const GRAVITY: Vec2 = Vec2::new(10.0, 200.0);
 /// Pushback factor for wall constraints. <1 leaves a residual overlap for the
 /// next substep to clean up — softer visuals, more stable.
 const WALL_DAMPING: f32 = 0.75;
-/// Per-substep push factor for the static obstacle (and the mouse cursor).
-const OBSTACLE_PUSH: f32 = 0.1;
 /// Pair-collision response: each particle absorbs half the overlap, scaled by
 /// `WALL_DAMPING` for consistency with the wall response.
 const COLLISION_RESPONSE: f32 = 0.5 * WALL_DAMPING;
@@ -171,6 +111,11 @@ pub struct Physics {
     /// Active obstacle list, rebuilt from `OBSTACLE_SCENE` at construction.
     /// Animated scenes (rotating bar) overwrite entries each step.
     obstacles: Vec<Obstacle>,
+    /// Per-bin obstacle indices (into `self.obstacles`). Built once for static
+    /// scenes, rebuilt every step for animated ones, then read in the hot
+    /// per-particle loop so each ball only tests obstacles it can actually
+    /// touch — turning an O(N·M) loop into O(N · m_local).
+    obstacle_bins: Vec<Vec<u32>>,
     /// Sim-time elapsed in seconds, accumulated from `step(dt)`. Drives all
     /// time-dependent obstacle/emitter scenes deterministically.
     sim_time: f32,
@@ -194,6 +139,8 @@ impl Physics {
             .unwrap();
 
         let obstacles = build_obstacles(OBSTACLE_SCENE, 0.0);
+        let mut obstacle_bins = vec![Vec::new(); NUM_BIN];
+        obstacles::rebuild_bins(&obstacles, &mut obstacle_bins);
 
         Physics {
             len: 0,
@@ -208,6 +155,7 @@ impl Physics {
             pending_radii,
             emit_acc: 0.0,
             obstacles,
+            obstacle_bins,
             sim_time: 0.0,
             emit_count: 0,
         }
@@ -224,11 +172,17 @@ impl Physics {
         let ymin_base = BORDER_PADDING;
 
         // Refresh animated obstacles before the per-particle pass (rotating
-        // bars rebuild their endpoints against the current sim_time).
+        // bars rebuild their endpoints against the current sim_time), and
+        // re-bin them so the lookup below stays in sync.
         if scene_is_animated(OBSTACLE_SCENE) {
             self.obstacles = build_obstacles(OBSTACLE_SCENE, self.sim_time);
+            obstacles::rebuild_bins(&self.obstacles, &mut self.obstacle_bins);
         }
         let obstacles = &self.obstacles;
+        let obstacle_bins = &self.obstacle_bins;
+        let inv_bin = 1.0 / BIN_SIZE as f32;
+        let bin_w_u32 = BIN_W as u32;
+        let bin_h_u32 = BIN_H as u32;
 
         for i in 0..self.len {
             let mut p = self.pos[i];
@@ -240,8 +194,18 @@ impl Physics {
             self.last_pos[i] = cur_xy;
             let mut np = cur_xy + diff + acc;
 
-            for obs in obstacles.iter() {
-                np = resolve_obstacle(np, r, obs);
+            // Look up only the obstacles registered to this particle's bin.
+            // `MAX_RADIUS * 2 ≤ BIN_SIZE` means a ball never spans more than
+            // 2 bins on any axis; padding obstacle AABBs by `MAX_RADIUS` when
+            // we register them guarantees that any obstacle the ball can
+            // touch from `np` is registered in `np`'s bin.
+            let bx = (np.x * inv_bin) as u32;
+            let by = (np.y * inv_bin) as u32;
+            if bx < bin_w_u32 && by < bin_h_u32 {
+                let bi = (bx * bin_h_u32 + by) as usize;
+                for &k in &obstacle_bins[bi] {
+                    np = obstacles::resolve(np, r, &obstacles[k as usize]);
+                }
             }
 
             let xmax = xmax_base - r;
@@ -523,6 +487,9 @@ impl Physics {
         T_CHECK_COLLISIONS.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
     }
 
+    /// Soft repel against an external collider (mouse cursor). Mirrors the
+    /// circle branch of `obstacles::resolve` but operates in-place on every
+    /// particle.
     pub fn avoid_obstacle(&mut self, pos: Vec2, size: f32) {
         for i in 0..self.len {
             let p = self.pos[i];
@@ -532,16 +499,22 @@ impl Physics {
             if dist2 < min_dist * min_dist {
                 let dist = dist2.sqrt();
                 let n = v / dist;
-                self.pos[i] -= (n * OBSTACLE_PUSH * (dist - min_dist)).extend(0.0);
+                self.pos[i] -= (n * obstacles::OBSTACLE_PUSH * (dist - min_dist)).extend(0.0);
             }
         }
     }
 
-    fn add_object(&mut self, pos: Vec2, vel: Vec2) {
+    /// Append a new particle with the next pre-drawn radius. Returns `false`
+    /// when the buffer is full so emitters can stop early. Used by `emit::*`.
+    pub(crate) fn try_add_object(&mut self, pos: Vec2, vel: Vec2) -> bool {
+        if self.len >= MAX_PARTICLES {
+            return false;
+        }
         let radius = self.pending_radii[self.len];
         self.pos[self.len] = pos.extend(radius);
         self.last_pos[self.len] = pos - vel;
         self.len += 1;
+        true
     }
 
     /// Rate-decoupled spawn driver: accumulates `dt * EMIT_BATCHES_PER_SEC`
@@ -555,127 +528,13 @@ impl Physics {
         }
     }
 
-    /// Emit one flow batch (~48 particles for the basic emitters). This is
-    /// the tuned unit of emission; the bench drives it directly, the GUI
-    /// goes through `emit_flow_for` for fps-independence. The active scene
-    /// (`EMIT_SCENE`) decides what shape the batch takes.
+    /// Emit one flow batch (~48 particles for the basic emitters). The active
+    /// `EMIT_SCENE` decides the batch shape; bench drives it directly, GUI
+    /// goes through `emit_flow_for` for fps-independence.
     pub fn emit_flow(&mut self) {
         let count = self.emit_count;
         self.emit_count = self.emit_count.wrapping_add(1);
-        match EMIT_SCENE {
-            EmitScene::Single => self.emit_single(),
-            EmitScene::TwoCrossing => self.emit_two_crossing(),
-            EmitScene::Fountain => self.emit_fountain(count),
-            EmitScene::Pulse => self.emit_pulse(count),
-            EmitScene::Rain => self.emit_rain(count),
-            EmitScene::YouDecide => {
-                // Rain on top, plus a sweeping fountain mixing things up.
-                self.emit_rain(count);
-                self.emit_fountain(count);
-            }
-        }
-    }
-
-    /// 16x3 diagonal stream from (200, 200), the historical default.
-    fn emit_single(&mut self) {
-        let dir = vec2(2.0, 1.0).normalize();
-        let space = MAX_RADIUS * 2.0 + 0.01;
-        for i in 0..16 {
-            let off_y = i as f32 * space;
-            for j in 0..3 {
-                if self.len >= MAX_PARTICLES {
-                    return;
-                }
-                self.add_object(
-                    vec2(200.0, 200.0 + off_y) + dir * space * j as f32,
-                    dir * 2.2,
-                );
-            }
-        }
-    }
-
-    /// Two crossing streams from the upper-left and upper-right corners.
-    /// Half the per-stream height of `Single` so the total batch stays ~48.
-    fn emit_two_crossing(&mut self) {
-        let space = MAX_RADIUS * 2.0 + 0.01;
-        let dir_l = vec2(2.0, 1.0).normalize();
-        let dir_r = vec2(-2.0, 1.0).normalize();
-        for i in 0..8 {
-            let off_y = i as f32 * space;
-            for j in 0..3 {
-                if self.len >= MAX_PARTICLES {
-                    return;
-                }
-                self.add_object(
-                    vec2(200.0, 200.0 + off_y) + dir_l * space * j as f32,
-                    dir_l * 2.2,
-                );
-                if self.len >= MAX_PARTICLES {
-                    return;
-                }
-                self.add_object(
-                    vec2(WIDTH as f32 - 200.0, 200.0 + off_y) + dir_r * space * j as f32,
-                    dir_r * 2.2,
-                );
-            }
-        }
-    }
-
-    /// Fan-shaped fountain: 48 particles across a 60-degree cone, all from
-    /// a single point. The cone direction sweeps slowly using `count` so the
-    /// fountain feels alive without wall-clock time.
-    fn emit_fountain(&mut self, count: u32) {
-        let origin = vec2(WIDTH as f32 * 0.5, HEIGHT as f32 - 200.0);
-        let speed = 6.0;
-        // Sweep ±30deg around straight up, with a slow oscillation.
-        let sweep = (count as f32 * 0.05).sin() * 0.3;
-        let half_cone: f32 = std::f32::consts::FRAC_PI_6;
-        let n = 48;
-        for k in 0..n {
-            if self.len >= MAX_PARTICLES {
-                return;
-            }
-            let t = k as f32 / (n - 1) as f32;
-            let ang = -std::f32::consts::FRAC_PI_2 + sweep + (t - 0.5) * 2.0 * half_cone;
-            let dir = vec2(ang.cos(), ang.sin());
-            self.add_object(origin + dir * MAX_RADIUS, dir * speed);
-        }
-    }
-
-    /// Pulse: emit a dense ring of particles every 60 calls (~1 s real time
-    /// at 60 batches/s). Quiet between bursts.
-    fn emit_pulse(&mut self, count: u32) {
-        if !count.is_multiple_of(60) {
-            return;
-        }
-        let center = vec2(WIDTH as f32 * 0.5, 200.0);
-        let n = 96;
-        for k in 0..n {
-            if self.len >= MAX_PARTICLES {
-                return;
-            }
-            let ang = (k as f32) * std::f32::consts::TAU / (n as f32);
-            let dir = vec2(ang.cos(), ang.sin());
-            self.add_object(center + dir * 30.0, dir * 5.0);
-        }
-    }
-
-    /// Rain: one row of 48 particles spread evenly across the top, falling
-    /// straight down. `count` shifts the row by half a spacing each call so
-    /// the grid pattern doesn't immediately visually resolve.
-    fn emit_rain(&mut self, count: u32) {
-        let n = 48;
-        let span = WIDTH as f32 - 2.0 * BORDER_PADDING - 40.0;
-        let step = span / (n - 1) as f32;
-        let offset = if count.is_multiple_of(2) { 0.0 } else { step * 0.5 };
-        let y = BORDER_PADDING + 10.0;
-        for k in 0..n {
-            if self.len >= MAX_PARTICLES {
-                return;
-            }
-            let x = BORDER_PADDING + 20.0 + k as f32 * step + offset;
-            self.add_object(vec2(x, y), vec2(0.0, 0.5));
-        }
+        emit::dispatch(self, count);
     }
 
     pub fn nb_particles(&self) -> usize {
@@ -696,203 +555,17 @@ impl Physics {
         &self.pos[..self.len]
     }
 
-    /// Renderable disc list for the active obstacle scene. Each entry is
-    /// `(center.xy, radius)` packed in a `Vec3`. Capsules are sampled into a
-    /// chain of overlapping discs so the same instanced-circle renderer can
-    /// draw them. Animated scenes refresh per `step()`, so callers should
-    /// re-read this each frame they want to draw.
-    pub fn obstacle_discs(&self) -> Vec<Vec3> {
-        let mut out = Vec::new();
-        for obs in self.obstacles.iter() {
-            match *obs {
-                Obstacle::Circle { center, radius } => {
-                    out.push(center.extend(radius));
-                }
-                Obstacle::Capsule { a, b, radius } => {
-                    let len = (b - a).length();
-                    let n = (len / radius).ceil().max(2.0) as usize;
-                    for k in 0..=n {
-                        let t = k as f32 / n as f32;
-                        let p = a + (b - a) * t;
-                        out.push(p.extend(radius));
-                    }
-                }
-            }
-        }
-        out
+    /// Renderable circle list (centre.xy, radius) for the active obstacle
+    /// scene. Rects go through `obstacle_rects` and a separate pipeline.
+    /// Animated scenes refresh per `step()`, so callers should re-read this
+    /// each frame they want to draw.
+    pub fn obstacle_circles(&self) -> Vec<Vec3> {
+        obstacles::circles_for(&self.obstacles)
     }
-}
 
-/// Per-scene obstacle layout. The `time` argument lets animated scenes (e.g.
-/// rotating bars) parameterise their geometry deterministically against the
-/// caller's `sim_time`. Static scenes ignore `time`.
-fn build_obstacles(scene: ObstacleScene, time: f32) -> Vec<Obstacle> {
-    let cx = WIDTH as f32 * 0.5;
-    let cy = HEIGHT as f32 * 0.5;
-    match scene {
-        ObstacleScene::Single => {
-            vec![Obstacle::Circle {
-                center: vec2(850.0, 600.0),
-                radius: 100.0,
-            }]
-        }
-        ObstacleScene::Pachinko => {
-            // 5 staggered rows, ~30..50 pegs total. Top row is just below the
-            // emitters; each row offsets by half the column spacing.
-            let mut out = Vec::new();
-            let rows = 6;
-            let cols_top = 6;
-            let row_dy = 110.0;
-            let col_dx = 130.0;
-            let top_y = 320.0;
-            for r in 0..rows {
-                let stagger = (r % 2) as f32 * 0.5 * col_dx;
-                let cols = cols_top + r;
-                let row_w = (cols - 1) as f32 * col_dx;
-                let row_x0 = cx - row_w * 0.5 + stagger - col_dx * 0.5 * (r as f32 / rows as f32);
-                let y = top_y + r as f32 * row_dy;
-                for c in 0..cols {
-                    let x = row_x0 + c as f32 * col_dx;
-                    out.push(Obstacle::Circle {
-                        center: vec2(x, y),
-                        radius: 18.0,
-                    });
-                }
-            }
-            out
-        }
-        ObstacleScene::RotatingBar => {
-            let half_len = 280.0;
-            let ang = time * BAR_ANGULAR_VEL;
-            let d = vec2(ang.cos(), ang.sin()) * half_len;
-            let center = vec2(cx, cy);
-            vec![Obstacle::Capsule {
-                a: center - d,
-                b: center + d,
-                radius: 20.0,
-            }]
-        }
-        ObstacleScene::Ring => {
-            // 12 pegs on a circle of radius 220 around the centre.
-            let n = 12;
-            let radius_ring = 220.0;
-            (0..n)
-                .map(|k| {
-                    let ang = k as f32 * std::f32::consts::TAU / n as f32;
-                    Obstacle::Circle {
-                        center: vec2(cx, cy) + vec2(ang.cos(), ang.sin()) * radius_ring,
-                        radius: 30.0,
-                    }
-                })
-                .collect()
-        }
-        ObstacleScene::FewCircles => vec![
-            Obstacle::Circle {
-                center: vec2(cx - 250.0, 500.0),
-                radius: 80.0,
-            },
-            Obstacle::Circle {
-                center: vec2(cx + 250.0, 500.0),
-                radius: 80.0,
-            },
-            Obstacle::Circle {
-                center: vec2(cx, 850.0),
-                radius: 110.0,
-            },
-        ],
-        ObstacleScene::YouDecide => {
-            // Small pachinko on top + two counter-rotating bars below.
-            let mut out = Vec::new();
-            let rows = 3;
-            let cols = 7;
-            let col_dx = 140.0;
-            let row_dy = 110.0;
-            let top_y = 320.0;
-            for r in 0..rows {
-                let stagger = (r % 2) as f32 * 0.5 * col_dx;
-                let row_w = (cols - 1) as f32 * col_dx;
-                let row_x0 = cx - row_w * 0.5 + stagger;
-                let y = top_y + r as f32 * row_dy;
-                for c in 0..cols {
-                    let x = row_x0 + c as f32 * col_dx;
-                    out.push(Obstacle::Circle {
-                        center: vec2(x, y),
-                        radius: 18.0,
-                    });
-                }
-            }
-            let bar_half = 200.0;
-            let ang_l = time * BAR_ANGULAR_VEL;
-            let ang_r = -time * BAR_ANGULAR_VEL;
-            let cl = vec2(cx - 280.0, 850.0);
-            let cr = vec2(cx + 280.0, 850.0);
-            let dl = vec2(ang_l.cos(), ang_l.sin()) * bar_half;
-            let dr = vec2(ang_r.cos(), ang_r.sin()) * bar_half;
-            out.push(Obstacle::Capsule {
-                a: cl - dl,
-                b: cl + dl,
-                radius: 18.0,
-            });
-            out.push(Obstacle::Capsule {
-                a: cr - dr,
-                b: cr + dr,
-                radius: 18.0,
-            });
-            out
-        }
-    }
-}
-
-/// Whether a scene needs its obstacle list rebuilt every step (rotating
-/// bars, swept colliders) or whether the layout is static.
-fn scene_is_animated(scene: ObstacleScene) -> bool {
-    matches!(scene, ObstacleScene::RotatingBar | ObstacleScene::YouDecide)
-}
-
-/// Resolve a single obstacle against a particle at `np` (radius `r`).
-/// Returns the corrected position; called once per obstacle per particle.
-#[inline(always)]
-fn resolve_obstacle(np: Vec2, r: f32, obs: &Obstacle) -> Vec2 {
-    match *obs {
-        Obstacle::Circle {
-            center,
-            radius: obs_r,
-        } => {
-            let v = np - center;
-            let dist2 = v.length_squared();
-            let min_dist = r + obs_r;
-            if dist2 < min_dist * min_dist && dist2 > 0.0 {
-                let dist = dist2.sqrt();
-                let n = v / dist;
-                np - n * OBSTACLE_PUSH * (dist - min_dist)
-            } else {
-                np
-            }
-        }
-        Obstacle::Capsule {
-            a,
-            b,
-            radius: obs_r,
-        } => {
-            // Closest point on segment ab to np.
-            let ab = b - a;
-            let len2 = ab.length_squared();
-            let t = if len2 > 0.0 {
-                ((np - a).dot(ab) / len2).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let closest = a + ab * t;
-            let v = np - closest;
-            let dist2 = v.length_squared();
-            let min_dist = r + obs_r;
-            if dist2 < min_dist * min_dist && dist2 > 0.0 {
-                let dist = dist2.sqrt();
-                let n = v / dist;
-                np - n * OBSTACLE_PUSH * (dist - min_dist)
-            } else {
-                np
-            }
-        }
+    /// Per-instance attributes for the oriented-rect render pipeline.
+    /// Returns an empty `Vec` if the active scene has no rects.
+    pub fn obstacle_rects(&self) -> Vec<obstacles::RectInstance> {
+        obstacles::rects_for(&self.obstacles)
     }
 }

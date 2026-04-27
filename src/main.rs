@@ -19,18 +19,12 @@ const CIRCLE_SIDES: usize = 12;
 const WIDTH: usize = 1200;
 const HEIGHT: usize = 1200;
 
+#[derive(Copy, Clone)]
 enum UpdateCommand {
     OneFrame,
     Continue,
     Stop,
     Quit,
-}
-
-impl Copy for UpdateCommand {}
-impl Clone for UpdateCommand {
-    fn clone(&self) -> Self {
-        *self
-    }
 }
 
 struct Stage {
@@ -169,7 +163,13 @@ impl Stage {
         let mut data: Vec<u8> = Vec::with_capacity(expected_len as usize);
         file.read_to_end(&mut data).unwrap();
         data.chunks(3)
-            .map(|col| vec3(col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0))
+            .map(|col| {
+                vec3(
+                    col[0] as f32 / 255.0,
+                    col[1] as f32 / 255.0,
+                    col[2] as f32 / 255.0,
+                )
+            })
             .collect()
     }
 
@@ -198,11 +198,12 @@ impl EventHandler for Stage {
         }
 
         let start = Instant::now();
+        // 120 Hz panel + vsync: 5 substeps of dt=1/600 advance 1/120 s of sim
+        // time per call, matching real-time. Each substep stays at dt=1/600 s,
+        // the value the physics is tuned for.
         let dt = 1. / 120.;
 
-        if self.frame_count.is_multiple_of(2) {
-            self.physics.emit_flow();
-        }
+        self.physics.emit_flow_for(dt);
 
         for _ in 0..5 {
             self.physics.step(dt / 5.0);
@@ -315,12 +316,10 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
-                let nb = self.physics.nb_particles();
                 let points: Vec<Vec3> = self
                     .physics
-                    .get_points()
+                    .active_points()
                     .iter()
-                    .take(nb)
                     .map(|p| {
                         let xy = p.xy().clamp(
                             vec2(100.0 + p.z, 100.0 + p.z),
@@ -334,8 +333,8 @@ impl EventHandler for Stage {
                     self.colors[i] = match point.y < 400.0 {
                         true => Vec3::ONE,
                         false => {
-                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32
-                                * img.width() as f32) as u32;
+                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32 * img.width() as f32)
+                                as u32;
                             let y = ((point.y - 400.0) / (HEIGHT - 500) as f32
                                 * img.height() as f32) as u32;
                             let pixel = img.get_pixel(x, y);
@@ -367,10 +366,9 @@ impl EventHandler for Stage {
     }
 
     fn draw(&mut self) {
-        let points = self.physics.get_points().to_vec();
         self.ctx.buffer_update(
             self.bindings.vertex_buffers[1],
-            BufferSource::slice(&points),
+            BufferSource::slice(self.physics.active_points()),
         );
 
         let proj = Mat4::orthographic_lh(0.0, WIDTH as f32, HEIGHT as f32, 0.0, 0.0, 1.0);
@@ -403,11 +401,8 @@ fn main() {
             window_width: WIDTH as i32,
             window_height: HEIGHT as i32,
             high_dpi: false,
-            // Vsync ON: caps the renderer to the display refresh rate. The
-            // physics uses a fixed dt = 1/60 s per update, so on a 60 Hz panel
-            // this gives real-time motion. On higher-refresh panels the sim
-            // looks proportionally faster — accepted trade-off vs the cost
-            // and imprecision of a software cap on macOS.
+            // Vsync ON. Software-only fps caps overshoot routinely on macOS, so
+            // we let the display drive the cadence and tune `update()` accordingly.
             platform: conf::Platform {
                 swap_interval: Some(1),
                 ..Default::default()
@@ -418,13 +413,10 @@ fn main() {
     );
 }
 
-/// Headless benchmark. Mirrors `Stage::update` exactly: `emit_flow` once per frame,
-/// `step(dt/10.0)` ten times, with `dt = 1/60`. Deterministic via `quad_rand::srand`.
+/// Headless deterministic benchmark: per "frame" we emit one batch and run
+/// 10 substeps of `dt = 1/60 / 10`. Defaults give a ~5 s run at ~28k particles.
 ///
-/// Budget is ~5 s wall-clock with defaults (28k particles). Override with CLI args.
-///
-/// Usage:
-///   physics --bench [frames=100] [warmup=500] [seed=1]
+/// Usage: `physics --bench [frames=100] [warmup=500] [seed=1]`
 fn run_bench(args: &[String]) {
     fn parse_or<T: std::str::FromStr>(s: Option<&String>, d: T) -> T {
         s.and_then(|v| v.parse().ok()).unwrap_or(d)

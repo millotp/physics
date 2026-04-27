@@ -59,7 +59,7 @@ pub enum Obstacle {
 /// Per-step angular velocity for the rotating bar variants (rad / sim-second).
 /// Stays deterministic since it's tied to the physics step count, not
 /// wall-clock time.
-const BAR_ANGULAR_VEL: f32 = 2.6;
+const BAR_ANGULAR_VEL: f32 = 5.0;
 
 /// Per-substep push factor for the static obstacle (and the mouse cursor).
 pub const OBSTACLE_PUSH: f32 = 0.1;

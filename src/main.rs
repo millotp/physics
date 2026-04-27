@@ -198,12 +198,14 @@ impl EventHandler for Stage {
         }
 
         let start = Instant::now();
-        let dt = 1. / 60.;
+        let dt = 1. / 120.;
 
-        self.physics.emit_flow();
+        if self.frame_count.is_multiple_of(2) {
+            self.physics.emit_flow();
+        }
 
-        for _ in 0..10 {
-            self.physics.step(dt / 10.0);
+        for _ in 0..5 {
+            self.physics.step(dt / 5.0);
         }
 
         if self.mouse_pressed {
@@ -401,6 +403,15 @@ fn main() {
             window_width: WIDTH as i32,
             window_height: HEIGHT as i32,
             high_dpi: false,
+            // Vsync ON: caps the renderer to the display refresh rate. The
+            // physics uses a fixed dt = 1/60 s per update, so on a 60 Hz panel
+            // this gives real-time motion. On higher-refresh panels the sim
+            // looks proportionally faster — accepted trade-off vs the cost
+            // and imprecision of a software cap on macOS.
+            platform: conf::Platform {
+                swap_interval: Some(1),
+                ..Default::default()
+            },
             ..Default::default()
         },
         || Box::new(Stage::new()),

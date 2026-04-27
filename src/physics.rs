@@ -51,6 +51,15 @@ const OBSTACLE_PADDING: f32 = 100.0;
 const _: () = assert!((WIDTH / BIN_SIZE).is_multiple_of(NB_THREAD));
 const _: () = assert!(MAX_RADIUS * 2.0 <= BIN_SIZE as f32);
 
+/// One bin-sorted particle slot on the collision hot path.
+///
+/// `(Vec3, u32)` is laid out as 16 B (12 B for position + 4 B for the original
+/// particle index) — vs. the previous `(Vec3, usize)` which alignment-padded to
+/// 24 B. That cuts memory traffic in `check_collisions` by ~33% for the same
+/// number of neighbour reads. The 32-bit index is enough since MAX_PARTICLES
+/// fits well under `u32::MAX`.
+type SortedSlot = (Vec3, u32);
+
 pub struct Bin {
     pub indexes: Vec<usize>,
 }
@@ -67,12 +76,9 @@ pub struct Physics {
     len: usize,
     pos: Vec<Vec3>,
     last_pos: Vec<Vec2>,
-    /// Bin-sorted particle data on the collision hot path.
-    /// `(Vec3, u32)` is laid out as 16 B (12 + 4) — vs. the previous
-    /// `(Vec3, usize)` which alignment-padded to 24 B. That cuts memory
-    /// traffic in `check_collisions` by ~33% for the same number of
-    /// neighbour reads.
-    sorted_pos: Vec<(Vec3, u32)>,
+    /// Bin-sorted particle data on the collision hot path. See `SortedSlot`
+    /// for the layout rationale.
+    sorted_pos: Vec<SortedSlot>,
     /// Rebuilt lazily from `sorted_pos` + `bin_start` when `get_bins()` is called.
     /// Not touched on the hot path.
     bins: Vec<Bin>,
@@ -152,10 +158,12 @@ impl Physics {
             let xmin = xmin_base + r;
             let ymax = ymax_base - r;
             let ymin = ymin_base + r;
-            if np.x > xmax { np.x += factor * (xmax - np.x); }
-            if np.x < xmin { np.x += factor * (xmin - np.x); }
-            if np.y > ymax { np.y += factor * (ymax - np.y); }
-            if np.y < ymin { np.y += factor * (ymin - np.y); }
+            let dx_over = (np.x - xmax).max(0.0);
+            let dx_under = (xmin - np.x).max(0.0);
+            let dy_over = (np.y - ymax).max(0.0);
+            let dy_under = (ymin - np.y).max(0.0);
+            np.x += factor * (dx_under - dx_over);
+            np.y += factor * (dy_under - dy_over);
 
             p.x = np.x;
             p.y = np.y;
@@ -171,18 +179,27 @@ impl Physics {
 
         let inv_bin = 1.0 / BIN_SIZE as f32;
 
-        // 1) Compute bin index per particle once and histogram in the same pass.
-        //    Reusing bin_idx for the scatter step saves 2 muls + 2 casts/particle.
+        // 1a) Compute bin index per particle in a SIMD-friendly streaming pass.
+        //     Splitting the bin-idx loop from the histogram lets the auto-vectoriser
+        //     run on the float→bin maths (fmul + fcvtzs), since the random scatter
+        //     into `bin_start` blocks vectorisation otherwise. Casting through u32
+        //     (instead of usize/u64) keeps the SIMD width at 4 lanes — fcvtzs.4s
+        //     instead of fcvtzu.2d, doubling the throughput on this stage.
+        let pos_slice = &self.pos[..self.len];
+        let bin_idx = &mut self.bin_idx[..self.len];
+        let bin_h_u32 = BIN_H as u32;
+        for (i, p) in pos_slice.iter().enumerate() {
+            let bx = (p.x * inv_bin) as u32;
+            let by = (p.y * inv_bin) as u32;
+            bin_idx[i] = by + bx * bin_h_u32;
+        }
+
+        // 1b) Histogram into bin_start[0..NUM_BIN].
         for c in &mut self.bin_start[..NUM_BIN] {
             *c = 0;
         }
-        for i in 0..self.len {
-            let p = self.pos[i];
-            let bx = (p.x * inv_bin) as usize;
-            let by = (p.y * inv_bin) as usize;
-            let b = by + bx * BIN_H;
-            self.bin_idx[i] = b as u32;
-            self.bin_start[b] += 1;
+        for &b in bin_idx.iter() {
+            self.bin_start[b as usize] += 1;
         }
 
         // 2) Exclusive prefix sum in-place; sentinel at [NUM_BIN] = total.
@@ -227,7 +244,7 @@ impl Physics {
             *slot = unsafe { *self.bin_start.get_unchecked(k * chunk_size) };
         }
 
-        let check_slice = |slice_pos: &mut [(Vec3, u32)],
+        let check_slice = |slice_pos: &mut [SortedSlot],
                            offset: usize,
                            start_x: usize,
                            width: usize,
@@ -295,7 +312,10 @@ impl Physics {
                                 let dn = (0.5 * 0.75) * (dist - min_dist) / (dist * min_dist);
                                 let v_scaled = v * dn;
                                 delta1 -= v_scaled * pos2.z;
-                                slice_pos[i2 - offset].0 += (v_scaled * pos1_z).extend(0.0);
+                                let i2_delta = v_scaled * pos1_z;
+                                let slot = unsafe { slice_pos.get_unchecked_mut(i2 - offset) };
+                                slot.0.x += i2_delta.x;
+                                slot.0.y += i2_delta.y;
                             }
                         }
 
@@ -311,13 +331,18 @@ impl Physics {
                                     let dn = (0.5 * 0.75) * (dist - min_dist) / (dist * min_dist);
                                     let v_scaled = v * dn;
                                     delta1 -= v_scaled * pos2.z;
-                                    slice_pos[i2 - offset].0 += (v_scaled * pos1_z).extend(0.0);
+                                    let i2_delta = v_scaled * pos1_z;
+                                    let slot = unsafe { slice_pos.get_unchecked_mut(i2 - offset) };
+                                    slot.0.x += i2_delta.x;
+                                    slot.0.y += i2_delta.y;
                                 }
                             }
                         }
 
                         if delta1 != Vec2::ZERO {
-                            slice_pos[i1 - offset].0 += delta1.extend(0.0);
+                            let slot = unsafe { slice_pos.get_unchecked_mut(i1 - offset) };
+                            slot.0.x += delta1.x;
+                            slot.0.y += delta1.y;
                         }
                     }
                 }
@@ -328,9 +353,9 @@ impl Physics {
         // breakpoints_thread, one per column-strip. `split_at_mut` chain produces
         // NB_THREAD disjoint &mut sub-slices — same pattern as the border pass above,
         // replacing the old `par_bridge` (which serialises on an internal mutex).
-        let mut main_subs: Vec<(&mut [(Vec3, u32)], usize, usize)> =
+        let mut main_subs: Vec<(&mut [SortedSlot], usize, usize)> =
             Vec::with_capacity(NB_THREAD);
-        let mut rest: &mut [(Vec3, u32)] = &mut self.sorted_pos[..];
+        let mut rest: &mut [SortedSlot] = &mut self.sorted_pos[..];
         for slice_i in 0..NB_THREAD {
             let a = breakpoints_thread[slice_i];
             let b = if slice_i + 1 < NB_THREAD {
@@ -374,9 +399,9 @@ impl Physics {
             }
         }
         // Strips are in increasing a-order; carve out non-overlapping &mut sub-slices.
-        let mut rest: &mut [(Vec3, u32)] = &mut self.sorted_pos[..];
+        let mut rest: &mut [SortedSlot] = &mut self.sorted_pos[..];
         let mut rest_off: usize = 0;
-        let mut sub_slices: Vec<(&mut [(Vec3, u32)], usize, usize)> =
+        let mut sub_slices: Vec<(&mut [SortedSlot], usize, usize)> =
             Vec::with_capacity(strips.len());
         for &(a, b, start_x) in &strips {
             let skip = a - rest_off;

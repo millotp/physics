@@ -39,7 +39,7 @@ pub fn print_breakdown(frames: usize) {
 
 pub const MAX_PARTICLES: usize = 70000;
 const MAX_RADIUS: f32 = 2.5;
-pub const NB_THREAD: usize = 24;
+pub const NB_THREAD: usize = 12;
 const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
 const BIN_H: usize = HEIGHT / BIN_SIZE;
@@ -67,7 +67,12 @@ pub struct Physics {
     len: usize,
     pos: Vec<Vec3>,
     last_pos: Vec<Vec2>,
-    sorted_pos: Vec<(Vec3, usize)>,
+    /// Bin-sorted particle data on the collision hot path.
+    /// `(Vec3, u32)` is laid out as 16 B (12 + 4) — vs. the previous
+    /// `(Vec3, usize)` which alignment-padded to 24 B. That cuts memory
+    /// traffic in `check_collisions` by ~33% for the same number of
+    /// neighbour reads.
+    sorted_pos: Vec<(Vec3, u32)>,
     /// Rebuilt lazily from `sorted_pos` + `bin_start` when `get_bins()` is called.
     /// Not touched on the hot path.
     bins: Vec<Bin>,
@@ -75,6 +80,10 @@ pub struct Physics {
     bin_start: Vec<usize>,
     /// Per-bin write cursor reused across scatter. Length = NUM_BIN.
     bin_cursor: Vec<usize>,
+    /// Per-particle bin index, computed once in `fill_bins` and reused for
+    /// histogram + scatter. Avoids recomputing `(x*inv_bin)*BIN_H + y*inv_bin`
+    /// twice per particle (saves 2 mul + 2 cast).
+    bin_idx: Vec<u32>,
 }
 
 impl Physics {
@@ -100,53 +109,57 @@ impl Physics {
             len: 0,
             pos,
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
-            sorted_pos: vec![(Vec3::ZERO, 0); MAX_PARTICLES],
+            sorted_pos: vec![(Vec3::ZERO, 0u32); MAX_PARTICLES],
             bins,
             bins_dirty: true,
             bin_start: vec![0; NUM_BIN + 1],
             bin_cursor: vec![0; NUM_BIN],
+            bin_idx: vec![0u32; MAX_PARTICLES],
         }
     }
 
-    fn apply_constraint(&mut self) {
-        let factor = 0.75;
+    /// Fused update_pos + apply_constraint. Both stages stream over `pos`/`last_pos`
+    /// and only touch `pos[i]`, so doing them in one pass keeps each particle's data
+    /// hot in L1 across both phases (cuts memory traffic on this stage by ~half).
+    fn update_and_constrain(&mut self, dt: f32) {
+        let factor: f32 = 0.75;
+        let acc = vec2(10.0, 200.0) * (dt * dt);
+        let xmax_base = WIDTH as f32 - BORDER_PADDING;
+        let ymax_base = HEIGHT as f32 - BORDER_PADDING;
+        let xmin_base = BORDER_PADDING;
+        let ymin_base = BORDER_PADDING;
+
         for i in 0..self.len {
-            self.apply_obstacle_constraint(i);
+            let mut p = self.pos[i];
+            let r = p.z;
 
-            if self.pos[i].x > WIDTH as f32 - BORDER_PADDING - self.pos[i].z {
-                self.pos[i].x += factor
-                    * (WIDTH as f32 - BORDER_PADDING - self.pos[i].z - self.pos[i].x);
-            }
-            if self.pos[i].x < BORDER_PADDING + self.pos[i].z {
-                self.pos[i].x += factor * (BORDER_PADDING + self.pos[i].z - self.pos[i].x);
-            }
-            if self.pos[i].y > HEIGHT as f32 - BORDER_PADDING - self.pos[i].z {
-                self.pos[i].y += factor
-                    * (HEIGHT as f32 - BORDER_PADDING - self.pos[i].z - self.pos[i].y);
-            }
-            if self.pos[i].y < BORDER_PADDING + self.pos[i].z {
-                self.pos[i].y += factor * (BORDER_PADDING + self.pos[i].z - self.pos[i].y);
-            }
-        }
-    }
+            let prev = self.last_pos[i];
+            let cur_xy = p.xy();
+            let diff = cur_xy - prev;
+            self.last_pos[i] = cur_xy;
+            let mut np = cur_xy + diff + acc;
 
-    #[inline]
-    fn apply_obstacle_constraint(&mut self, i: usize) {
-        let v = self.pos[i].xy() - OBSTACLE_POS;
-        let dist2 = v.length_squared();
-        let min_dist = self.pos[i].z + OBSTACLE_PADDING;
-        if dist2 < min_dist * min_dist {
-            let dist = dist2.sqrt();
-            let n = v / dist;
-            self.pos[i] -= (n * 0.1 * (dist - min_dist)).extend(0.0);
-        }
-    }
+            let v = np - OBSTACLE_POS;
+            let dist2 = v.length_squared();
+            let obs_min = r + OBSTACLE_PADDING;
+            if dist2 < obs_min * obs_min {
+                let dist = dist2.sqrt();
+                let n = v / dist;
+                np -= n * 0.1 * (dist - obs_min);
+            }
 
-    fn update_pos(&mut self, dt: f32) {
-        for (i, pos) in self.pos.iter_mut().take(self.len).enumerate() {
-            let diff = pos.xy() - self.last_pos[i];
-            self.last_pos[i] = pos.xy();
-            *pos += (diff + vec2(10.0, 200.0) * (dt * dt)).extend(0.0);
+            let xmax = xmax_base - r;
+            let xmin = xmin_base + r;
+            let ymax = ymax_base - r;
+            let ymin = ymin_base + r;
+            if np.x > xmax { np.x += factor * (xmax - np.x); }
+            if np.x < xmin { np.x += factor * (xmin - np.x); }
+            if np.y > ymax { np.y += factor * (ymax - np.y); }
+            if np.y < ymin { np.y += factor * (ymin - np.y); }
+
+            p.x = np.x;
+            p.y = np.y;
+            self.pos[i] = p;
         }
     }
 
@@ -156,16 +169,20 @@ impl Physics {
         // and `bins` is reconstructed lazily in `get_bins()` when the UI needs it.
         self.bins_dirty = true;
 
-        // 1) Histogram into bin_start[0..NUM_BIN] (reusing it as the count buffer).
+        let inv_bin = 1.0 / BIN_SIZE as f32;
+
+        // 1) Compute bin index per particle once and histogram in the same pass.
+        //    Reusing bin_idx for the scatter step saves 2 muls + 2 casts/particle.
         for c in &mut self.bin_start[..NUM_BIN] {
             *c = 0;
         }
-        let inv_bin = 1.0 / BIN_SIZE as f32;
         for i in 0..self.len {
             let p = self.pos[i];
             let bx = (p.x * inv_bin) as usize;
             let by = (p.y * inv_bin) as usize;
-            self.bin_start[by + bx * BIN_H] += 1;
+            let b = by + bx * BIN_H;
+            self.bin_idx[i] = b as u32;
+            self.bin_start[b] += 1;
         }
 
         // 2) Exclusive prefix sum in-place; sentinel at [NUM_BIN] = total.
@@ -178,16 +195,13 @@ impl Physics {
         self.bin_start[NUM_BIN] = acc;
         debug_assert_eq!(acc, self.len);
 
-        // 3) Scatter. Cursors start at each bin's bin_start.
+        // 3) Scatter using cached bin indices.
         self.bin_cursor.copy_from_slice(&self.bin_start[..NUM_BIN]);
         for i in 0..self.len {
-            let p = self.pos[i];
-            let bx = (p.x * inv_bin) as usize;
-            let by = (p.y * inv_bin) as usize;
-            let b = by + bx * BIN_H;
+            let b = self.bin_idx[i] as usize;
             let slot = self.bin_cursor[b];
             self.bin_cursor[b] = slot + 1;
-            self.sorted_pos[slot] = (p, i);
+            self.sorted_pos[slot] = (self.pos[i], i as u32);
         }
     }
 
@@ -198,7 +212,7 @@ impl Physics {
             bin.indexes.clear();
             let a = self.bin_start[bi];
             let b = self.bin_start[bi + 1];
-            bin.indexes.extend(self.sorted_pos[a..b].iter().map(|sp| sp.1));
+            bin.indexes.extend(self.sorted_pos[a..b].iter().map(|sp| sp.1 as usize));
         }
         self.bins_dirty = false;
     }
@@ -207,15 +221,13 @@ impl Physics {
         let chunk_size = NUM_BIN / NB_THREAD;
         let thread_width = BIN_W / NB_THREAD;
 
-        let breakpoints_thread = self
-            .bin_start
-            .iter()
-            .take(NUM_BIN)
-            .step_by(chunk_size)
-            .copied()
-            .collect::<Vec<usize>>();
+        // Avoid the per-substep Vec alloc — just probe NB_THREAD points in bin_start.
+        let mut breakpoints_thread = [0usize; NB_THREAD];
+        for (k, slot) in breakpoints_thread.iter_mut().enumerate() {
+            *slot = unsafe { *self.bin_start.get_unchecked(k * chunk_size) };
+        }
 
-        let check_slice = |slice_pos: &mut [(Vec3, usize)],
+        let check_slice = |slice_pos: &mut [(Vec3, u32)],
                            offset: usize,
                            start_x: usize,
                            width: usize,
@@ -235,36 +247,38 @@ impl Physics {
                         continue;
                     }
 
-                    // Collect only neighbours with bin index > bin1 (so all i2 > i1),
-                    // plus the same-bin case handled separately below.
-                    // `bin_start` is monotonic non-decreasing, so a neighbour bin_n with
-                    // bin_n < bin1 has all its i2 < i1 -> nothing to do.
-                    let mut fwd_ranges: [(usize, usize); 8] = [(0, 0); 8];
+                    // Forward neighbours have exactly 4 candidates with bin2 > bin1:
+                    //   (0,+1):     bin1+1                     - same column, +1 row
+                    //   (+1,-1..1): bin1+BIN_H-1 .. bin1+BIN_H+1 - next column, 3 rows
+                    // The 3 right-column bins are contiguous in `bin_start`, so we can
+                    // collapse them into a single range using the prefix-sum property:
+                    //   range = [bin_start[bin1+BIN_H-1], bin_start[bin1+BIN_H+2])
+                    // Two range lookups instead of four — fewer indirect loads, fewer
+                    // branches, smaller scratch array.
+                    let row_lo = unsafe { *bin_start.get_unchecked(bin1 + 1) };
+                    let row_hi = unsafe { *bin_start.get_unchecked(bin1 + 2) };
+                    let col_b = bin1 + BIN_H;
+                    let col_lo = unsafe { *bin_start.get_unchecked(col_b - 1) };
+                    let col_hi = unsafe { *bin_start.get_unchecked(col_b + 2) };
+                    let mut fwd_ranges: [(usize, usize); 2] = [(0, 0); 2];
                     let mut fwd_n = 0usize;
-                    for (off_i, off_j) in [
-                        (-1i32, -1i32), (-1, 0), (-1, 1),
-                        (0, -1), /* (0,0) same bin */ (0, 1),
-                        (1, -1), (1, 0), (1, 1),
-                    ] {
-                        let nbx = (bin_x as i32 + off_i) as usize;
-                        let nby = (bin_y as i32 + off_j) as usize;
-                        let bin2 = nby + nbx * BIN_H;
-                        if bin2 <= bin1 {
-                            continue;
-                        }
-                        let (lo, hi) = unsafe {
-                            (*bin_start.get_unchecked(bin2),
-                             *bin_start.get_unchecked(bin2 + 1))
-                        };
-                        if lo < hi {
-                            fwd_ranges[fwd_n] = (lo, hi);
-                            fwd_n += 1;
-                        }
+                    if row_lo < row_hi {
+                        fwd_ranges[fwd_n] = (row_lo, row_hi);
+                        fwd_n += 1;
+                    }
+                    if col_lo < col_hi {
+                        fwd_ranges[fwd_n] = (col_lo, col_hi);
+                        fwd_n += 1;
                     }
 
                     for i1 in i1_lo..i1_hi {
                         let (pos1, _) = slice_pos[i1 - offset];
                         let pos1_z = pos1.z;
+                        // Batch the i1 write across all hits this iteration.
+                        // i1 isn't read as i2 inside this i1 iteration (same-bin uses
+                        // i2 > i1, fwd uses different bins), so deferring the write
+                        // is safe. Saves repeated memory RMWs to the same slot.
+                        let mut delta1 = Vec2::ZERO;
 
                         // Same-bin: start at i1+1 so i2 > i1 is guaranteed, no predicate.
                         for i2 in (i1 + 1)..i1_hi {
@@ -273,13 +287,15 @@ impl Physics {
                             let dist2 = v.length_squared();
                             let min_dist = pos1_z + pos2.z;
                             if dist2 < min_dist * min_dist {
+                                // Folded form: scale_k = delta * z_other / (dist * min_dist).
+                                // Precomputing `delta / (dist * min_dist)` once turns the
+                                // 1×sqrt + 3×fdiv body into 1×sqrt + 1×fdiv (4 fewer
+                                // serial cycles on Apple Silicon's FP unit per hit).
                                 let dist = dist2.sqrt();
-                                let inv_min = 1.0 / min_dist;
-                                let delta = 0.5 * 0.75 * (dist - min_dist);
-                                let scale1 = delta * pos2.z * inv_min / dist;
-                                let scale2 = delta * pos1_z * inv_min / dist;
-                                slice_pos[i1 - offset].0 -= (v * scale1).extend(0.0);
-                                slice_pos[i2 - offset].0 += (v * scale2).extend(0.0);
+                                let dn = (0.5 * 0.75) * (dist - min_dist) / (dist * min_dist);
+                                let v_scaled = v * dn;
+                                delta1 -= v_scaled * pos2.z;
+                                slice_pos[i2 - offset].0 += (v_scaled * pos1_z).extend(0.0);
                             }
                         }
 
@@ -292,14 +308,16 @@ impl Physics {
                                 let min_dist = pos1_z + pos2.z;
                                 if dist2 < min_dist * min_dist {
                                     let dist = dist2.sqrt();
-                                    let inv_min = 1.0 / min_dist;
-                                    let delta = 0.5 * 0.75 * (dist - min_dist);
-                                    let scale1 = delta * pos2.z * inv_min / dist;
-                                    let scale2 = delta * pos1_z * inv_min / dist;
-                                    slice_pos[i1 - offset].0 -= (v * scale1).extend(0.0);
-                                    slice_pos[i2 - offset].0 += (v * scale2).extend(0.0);
+                                    let dn = (0.5 * 0.75) * (dist - min_dist) / (dist * min_dist);
+                                    let v_scaled = v * dn;
+                                    delta1 -= v_scaled * pos2.z;
+                                    slice_pos[i2 - offset].0 += (v_scaled * pos1_z).extend(0.0);
                                 }
                             }
+                        }
+
+                        if delta1 != Vec2::ZERO {
+                            slice_pos[i1 - offset].0 += delta1.extend(0.0);
                         }
                     }
                 }
@@ -310,9 +328,9 @@ impl Physics {
         // breakpoints_thread, one per column-strip. `split_at_mut` chain produces
         // NB_THREAD disjoint &mut sub-slices — same pattern as the border pass above,
         // replacing the old `par_bridge` (which serialises on an internal mutex).
-        let mut main_subs: Vec<(&mut [(Vec3, usize)], usize, usize)> =
+        let mut main_subs: Vec<(&mut [(Vec3, u32)], usize, usize)> =
             Vec::with_capacity(NB_THREAD);
-        let mut rest: &mut [(Vec3, usize)] = &mut self.sorted_pos[..];
+        let mut rest: &mut [(Vec3, u32)] = &mut self.sorted_pos[..];
         for slice_i in 0..NB_THREAD {
             let a = breakpoints_thread[slice_i];
             let b = if slice_i + 1 < NB_THREAD {
@@ -356,9 +374,9 @@ impl Physics {
             }
         }
         // Strips are in increasing a-order; carve out non-overlapping &mut sub-slices.
-        let mut rest: &mut [(Vec3, usize)] = &mut self.sorted_pos[..];
+        let mut rest: &mut [(Vec3, u32)] = &mut self.sorted_pos[..];
         let mut rest_off: usize = 0;
-        let mut sub_slices: Vec<(&mut [(Vec3, usize)], usize, usize)> =
+        let mut sub_slices: Vec<(&mut [(Vec3, u32)], usize, usize)> =
             Vec::with_capacity(strips.len());
         for &(a, b, start_x) in &strips {
             let skip = a - rest_off;
@@ -375,18 +393,16 @@ impl Physics {
             });
 
         for sp in self.sorted_pos.iter().take(self.len) {
-            self.pos[sp.1] = sp.0;
+            self.pos[sp.1 as usize] = sp.0;
         }
     }
 
     pub fn step(&mut self, dt: f32) {
         let t = Instant::now();
-        self.update_pos(dt);
+        self.update_and_constrain(dt);
+        // Counted under update_pos so the breakdown still adds up; the merged
+        // stage now covers what was previously update_pos + apply_constraint.
         T_UPDATE_POS.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
-
-        let t = Instant::now();
-        self.apply_constraint();
-        T_APPLY_CONSTRAINT.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
 
         let t = Instant::now();
         self.fill_bins();

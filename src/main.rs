@@ -13,11 +13,17 @@ use miniquad::*;
 use image::ImageReader;
 
 use glam::{vec2, vec3, Mat4, Vec2, Vec3, Vec3Swizzles};
-use physics::{Physics, BIN_W, MAX_PARTICLES, NB_THREAD};
+use physics::{Physics, BIN_W, BORDER_PADDING, MAX_PARTICLES, NB_THREAD};
 
 const CIRCLE_SIDES: usize = 12;
+/// Logical simulation world size, in physics units. The bin grid, particle
+/// coordinates and ortho projection all use these values.
 const WIDTH: usize = 1200;
 const HEIGHT: usize = 1200;
+/// On-screen window size, in points. Independent of `WIDTH`/`HEIGHT`: the
+/// ortho projection maps the world into the window via NDC. Kept square so
+/// the world's square aspect ratio is preserved on screen.
+const WINDOW_SIZE: i32 = 800;
 
 #[derive(Copy, Clone)]
 enum UpdateCommand {
@@ -27,10 +33,20 @@ enum UpdateCommand {
     Quit,
 }
 
+/// Soft cap on the number of discs needed to draw any obstacle scene
+/// (capsules expand into a small chain of overlapping circles). Way more
+/// than the busiest current scene needs.
+const MAX_OBSTACLE_DISCS: usize = 256;
+
 struct Stage {
     ctx: Box<dyn RenderingBackend>,
     pipeline: Pipeline,
     bindings: Bindings,
+    /// Bindings reused for the obstacle draw call: same circle geometry +
+    /// index buffer, but the per-instance buffers are dedicated to obstacles.
+    obstacle_bindings: Bindings,
+    /// Streaming buffer for obstacle (center.xy, radius) packed as `Vec3`.
+    obstacle_pos_buffer: BufferId,
 
     physics: Physics,
     colors: Vec<Vec3>,
@@ -95,6 +111,33 @@ impl Stage {
             images: vec![],
         };
 
+        // Obstacle rendering: a streaming pos-buffer, an immutable dark-grey
+        // colors buffer, and a separate `Bindings` reusing the same circle
+        // geometry. The `Stream` usage lets animated scenes refresh
+        // positions per frame without re-creating the buffer.
+        let obstacle_pos_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Stream,
+            BufferSource::empty::<Vec3>(MAX_OBSTACLE_DISCS),
+        );
+        let obstacle_colors: Vec<Vec3> = (0..MAX_OBSTACLE_DISCS)
+            .map(|_| vec3(0.35, 0.35, 0.40))
+            .collect();
+        let obstacle_color_buffer = ctx.new_buffer(
+            BufferType::VertexBuffer,
+            BufferUsage::Immutable,
+            BufferSource::slice(&obstacle_colors),
+        );
+        let obstacle_bindings = Bindings {
+            vertex_buffers: vec![
+                geometry_vertex_buffer,
+                obstacle_pos_buffer,
+                obstacle_color_buffer,
+            ],
+            index_buffer,
+            images: vec![],
+        };
+
         let shader = ctx
             .new_shader(
                 ShaderSource::Glsl {
@@ -130,6 +173,8 @@ impl Stage {
             ctx,
             pipeline,
             bindings,
+            obstacle_bindings,
+            obstacle_pos_buffer,
             physics,
             colors,
             last_frame: Instant::now(),
@@ -316,31 +361,41 @@ impl EventHandler for Stage {
                     .unwrap()
                     .to_rgb32f();
 
+                // Playable area in world coords. Particles are clamped here
+                // before sampling the image so we don't read out of bounds.
+                let pad = BORDER_PADDING;
+                let world_w = WIDTH as f32 - 2.0 * pad;
+                // Reserve the top of the playable area for a white "sky" band
+                // (matches the original look). The image is mapped onto the
+                // remainder.
+                let sky_h: f32 = 300.0;
+                let img_top = pad + sky_h;
+                let img_h = HEIGHT as f32 - pad - img_top;
+
                 let points: Vec<Vec3> = self
                     .physics
                     .active_points()
                     .iter()
                     .map(|p| {
                         let xy = p.xy().clamp(
-                            vec2(100.0 + p.z, 100.0 + p.z),
-                            vec2(WIDTH as f32 - 100.0 - p.z, HEIGHT as f32 - 100.0 - p.z),
+                            vec2(pad + p.z, pad + p.z),
+                            vec2(WIDTH as f32 - pad - p.z, HEIGHT as f32 - pad - p.z),
                         );
                         xy.extend(p.z)
                     })
                     .collect();
 
                 for (i, point) in points.iter().enumerate() {
-                    self.colors[i] = match point.y < 400.0 {
-                        true => Vec3::ONE,
-                        false => {
-                            let x = ((point.x - 100.0) / (WIDTH - 200) as f32 * img.width() as f32)
-                                as u32;
-                            let y = ((point.y - 400.0) / (HEIGHT - 500) as f32
-                                * img.height() as f32) as u32;
-                            let pixel = img.get_pixel(x, y);
-                            vec3(pixel[0], pixel[1], pixel[2])
-                        }
-                    }
+                    self.colors[i] = if point.y < img_top {
+                        Vec3::ONE
+                    } else {
+                        let u = (point.x - pad) / world_w;
+                        let v = (point.y - img_top) / img_h;
+                        let x = (u * img.width() as f32) as u32;
+                        let y = (v * img.height() as f32) as u32;
+                        let pixel = img.get_pixel(x, y);
+                        vec3(pixel[0], pixel[1], pixel[2])
+                    };
                 }
 
                 let colors_vertex_buffer = self.ctx.new_buffer(
@@ -371,14 +426,41 @@ impl EventHandler for Stage {
             BufferSource::slice(self.physics.active_points()),
         );
 
-        let proj = Mat4::orthographic_lh(0.0, WIDTH as f32, HEIGHT as f32, 0.0, 0.0, 1.0);
+        let obstacle_discs = self.physics.obstacle_discs();
+        let obstacle_count = obstacle_discs.len().min(MAX_OBSTACLE_DISCS);
+        if obstacle_count > 0 {
+            self.ctx.buffer_update(
+                self.obstacle_pos_buffer,
+                BufferSource::slice(&obstacle_discs[..obstacle_count]),
+            );
+        }
+
+        // Camera: zoom to the playable area (i.e. inside `BORDER_PADDING`)
+        // so the wall buffer that physics needs doesn't show up as a visible
+        // black border in the window.
+        let proj = Mat4::orthographic_lh(
+            BORDER_PADDING,
+            WIDTH as f32 - BORDER_PADDING,
+            HEIGHT as f32 - BORDER_PADDING,
+            BORDER_PADDING,
+            0.0,
+            1.0,
+        );
 
         self.ctx.begin_default_pass(Default::default());
 
         self.ctx.apply_pipeline(&self.pipeline);
-        self.ctx.apply_bindings(&self.bindings);
         self.ctx
             .apply_uniforms(UniformsSource::table(&shader::Uniforms { mvp: proj }));
+
+        // Obstacles first so particles render on top of them.
+        if obstacle_count > 0 {
+            self.ctx.apply_bindings(&self.obstacle_bindings);
+            self.ctx
+                .draw(0, (CIRCLE_SIDES * 3) as i32, obstacle_count as i32);
+        }
+
+        self.ctx.apply_bindings(&self.bindings);
         self.ctx.draw(
             0,
             (CIRCLE_SIDES * 3) as i32,
@@ -398,9 +480,20 @@ fn main() {
     }
     miniquad::start(
         conf::Conf {
-            window_width: WIDTH as i32,
-            window_height: HEIGHT as i32,
-            high_dpi: false,
+            // The window is in screen points, decoupled from `WIDTH`/`HEIGHT`
+            // (the simulation's logical world). The ortho projection maps the
+            // 1200x1200 world onto whatever the framebuffer is, so circles
+            // stay round and the window can be any square size that fits on
+            // the user's display.
+            window_width: WINDOW_SIZE,
+            window_height: WINDOW_SIZE,
+            // HiDPI on so the framebuffer matches the display's physical
+            // pixel density (crisp on Retina). Aspect stays square since
+            // both axes scale by the same dpi factor.
+            high_dpi: true,
+            // Lock the window to a square so the simulation can never be
+            // squashed by a manual resize.
+            window_resizable: false,
             // Vsync ON. Software-only fps caps overshoot routinely on macOS, so
             // we let the display drive the cadence and tune `update()` accordingly.
             platform: conf::Platform {
@@ -487,5 +580,42 @@ fn run_bench(args: &[String]) {
         frames,
         total as f64 / 1000.0,
         frames as f64 * 1_000_000.0 / total as f64
+    );
+}
+
+/// Headless replay of the GUI's `update()` body. Identical control flow,
+/// no rendering or input. Prints a position signature so determinism can
+/// be asserted byte-perfectly across runs of the same scene.
+fn run_gui_sig(args: &[String]) {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).skip(1).collect();
+    let parse_or = |s: Option<&&String>, default: u64| -> u64 {
+        s.and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let frames: u64 = parse_or(positional.first(), 600);
+    let seed: u64 = parse_or(positional.get(1), 1);
+
+    quad_rand::srand(seed);
+    let mut physics = Physics::new();
+    let dt: f32 = 1.0 / 120.0;
+    for _ in 0..frames {
+        physics.emit_flow_for(dt);
+        for _ in 0..5 {
+            physics.step(dt / 5.0);
+        }
+    }
+
+    let mut sx: f64 = 0.0;
+    let mut sy: f64 = 0.0;
+    for p in physics.active_points() {
+        sx += p.x as f64;
+        sy += p.y as f64;
+    }
+    println!(
+        "gui_sig frames={} seed={} n={} sum_x={:.4} sum_y={:.4}",
+        frames,
+        seed,
+        physics.nb_particles(),
+        sx,
+        sy
     );
 }

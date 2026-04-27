@@ -42,7 +42,7 @@ pub fn print_breakdown(frames: usize) {
 
 pub const MAX_PARTICLES: usize = 70000;
 const MAX_RADIUS: f32 = 2.5;
-pub const NB_THREAD: usize = 12;
+pub const NB_THREAD: usize = 8;
 const BIN_SIZE: usize = 5;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
 const BIN_H: usize = HEIGHT / BIN_SIZE;

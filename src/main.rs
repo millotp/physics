@@ -300,7 +300,6 @@ impl Stage {
     }
 }
 
-/// Build the unit-circle fan geometry + index buffer used by every disc draw.
 /// Map a cursor position from miniquad's mouse-event coordinate space to
 /// simulation world units. With `high_dpi: true`, miniquad delivers cursor
 /// coordinates in *physical pixels* (logical points × `dpi_scale`), so we
@@ -352,9 +351,8 @@ impl EventHandler for Stage {
         }
 
         let start = Instant::now();
-        // 120 Hz panel + vsync: 5 substeps of dt=1/600 advance 1/120 s of sim
-        // time per call, matching real-time. Each substep stays at dt=1/600 s,
-        // the value the physics is tuned for.
+        // 120 Hz panel + vsync: each `update()` advances 1/120 s of sim time,
+        // split into 5 substeps of `1/600 s` (the value the solver is tuned for).
         let dt = 1. / 120.;
 
         self.physics.emit_flow_for(dt);
@@ -612,14 +610,6 @@ fn main() {
         run_bench(&args);
         return;
     }
-    if args.iter().any(|a| a == "--gui-sig") {
-        run_gui_sig(&args);
-        return;
-    }
-    if args.iter().any(|a| a == "--drift") {
-        run_drift(&args);
-        return;
-    }
     miniquad::start(
         conf::Conf {
             // The window is in screen points, decoupled from `WIDTH`/`HEIGHT`
@@ -725,99 +715,3 @@ fn run_bench(args: &[String]) {
     );
 }
 
-/// Headless replay of the GUI's `update()` body. Identical control flow,
-/// no rendering or input. Prints a position signature so determinism can
-/// be asserted byte-perfectly across runs of the same scene.
-/// Diagnostic for the lateral drift bug at high particle density. Spawns
-/// particles deterministically, periodically prints the centre-of-mass x
-/// of the bottom 10% of particles relative to world centre `WIDTH/2`. A
-/// sustained increase = rightward drift, a decrease = leftward drift,
-/// noise around zero = no drift.
-fn run_drift(args: &[String]) {
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).skip(1).collect();
-    let parse_or = |s: Option<&&String>, default: u64| -> u64 {
-        s.and_then(|v| v.parse().ok()).unwrap_or(default)
-    };
-    let frames: u64 = parse_or(positional.first(), 6000);
-    let seed: u64 = parse_or(positional.get(1), 1);
-    let print_every: u64 = parse_or(positional.get(2), 200);
-
-    quad_rand::srand(seed);
-    let mut physics = Physics::new();
-    let dt: f32 = 1.0 / 120.0;
-    let cx = WIDTH as f32 * 0.5;
-    println!("drift seed={} world_cx={:.1} (positive cm_dx = rightward drift)", seed, cx);
-    for f in 0..frames {
-        physics.emit_flow_for(dt);
-        for _ in 0..5 {
-            physics.step(dt / 5.0);
-        }
-        if (f + 1) % print_every == 0 {
-            let pts = physics.active_points();
-            let last = physics.active_last_pos();
-            if pts.is_empty() {
-                continue;
-            }
-            let mut ys: Vec<f32> = pts.iter().map(|p| p.y).collect();
-            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            let cutoff_idx = (ys.len() as f32 * 0.9) as usize;
-            let cutoff_y = ys[cutoff_idx.min(ys.len() - 1)];
-            let mut sum_x = 0.0f64;
-            let mut sum_vx = 0.0f64;
-            let mut count = 0u64;
-            for (p, lp) in pts.iter().zip(last.iter()) {
-                if p.y >= cutoff_y {
-                    sum_x += p.x as f64;
-                    sum_vx += (p.x - lp.x) as f64;
-                    count += 1;
-                }
-            }
-            let cm_x = if count > 0 { sum_x / count as f64 } else { 0.0 };
-            let cm_vx = if count > 0 { sum_vx / count as f64 } else { 0.0 };
-            let dx = cm_x - cx as f64;
-            println!(
-                "frame={:>5} n={:>6} bot_n={:>5} cm_x={:>9.3} cm_dx={:+8.3} mean_vx={:+8.5}",
-                f + 1,
-                pts.len(),
-                count,
-                cm_x,
-                dx,
-                cm_vx
-            );
-        }
-    }
-}
-
-fn run_gui_sig(args: &[String]) {
-    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).skip(1).collect();
-    let parse_or = |s: Option<&&String>, default: u64| -> u64 {
-        s.and_then(|v| v.parse().ok()).unwrap_or(default)
-    };
-    let frames: u64 = parse_or(positional.first(), 600);
-    let seed: u64 = parse_or(positional.get(1), 1);
-
-    quad_rand::srand(seed);
-    let mut physics = Physics::new();
-    let dt: f32 = 1.0 / 120.0;
-    for _ in 0..frames {
-        physics.emit_flow_for(dt);
-        for _ in 0..5 {
-            physics.step(dt / 5.0);
-        }
-    }
-
-    let mut sx: f64 = 0.0;
-    let mut sy: f64 = 0.0;
-    for p in physics.active_points() {
-        sx += p.x as f64;
-        sy += p.y as f64;
-    }
-    println!(
-        "gui_sig frames={} seed={} n={} sum_x={:.4} sum_y={:.4}",
-        frames,
-        seed,
-        physics.nb_particles(),
-        sx,
-        sy
-    );
-}

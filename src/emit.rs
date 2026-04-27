@@ -112,10 +112,11 @@ fn fountain(physics: &mut Physics, count: u32) {
     }
 }
 
-/// Pulse: emit a dense ring of particles every 60 calls (~1 s real time
-/// at 60 batches/s). Quiet between bursts.
+/// Pulse: emit a dense ring of particles once per second (the modulus
+/// matches `EMIT_BATCHES_PER_SEC` so the cadence is wall-clock-stable).
+/// Quiet between bursts.
 fn pulse(physics: &mut Physics, count: u32) {
-    if !count.is_multiple_of(60) {
+    if !count.is_multiple_of(EMIT_BATCHES_PER_SEC as u32) {
         return;
     }
     let speed = 1.0;

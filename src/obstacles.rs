@@ -8,7 +8,7 @@ use crate::physics::{BIN_H, BIN_SIZE, BIN_W, MAX_RADIUS, NUM_BIN};
 use crate::{HEIGHT, WIDTH};
 
 /// Active obstacle scene. Pick a variant to change the playfield layout.
-pub const OBSTACLE_SCENE: ObstacleScene = ObstacleScene::RotatingBar;
+pub const OBSTACLE_SCENE: ObstacleScene = ObstacleScene::Cascade;
 
 /// What static / animated obstacles populate the playfield.
 #[allow(
@@ -23,10 +23,18 @@ pub enum ObstacleScene {
     Pachinko,
     /// A long oblong (capsule) sweeping around the centre.
     RotatingBar,
+    /// Five small rotating crosses (two perpendicular rects per cross),
+    /// each spinning at a different phase.
+    RotatingCrosses,
     /// Ring of pegs around the centre.
     Ring,
     /// Three big circles at distinctive positions.
     FewCircles,
+    /// A multi-stage path: splitter circle, V-funnel, rotating paddle,
+    /// flanking circles, narrowing chevron, second paddle, bottom deflector.
+    /// Designed to be paired with `EmitScene::Stream` so particles enter
+    /// from the top centre and visibly thread through every stage.
+    Cascade,
 }
 
 /// Static and animated colliders.
@@ -51,7 +59,7 @@ pub enum Obstacle {
 /// Per-step angular velocity for the rotating bar variants (rad / sim-second).
 /// Stays deterministic since it's tied to the physics step count, not
 /// wall-clock time.
-const BAR_ANGULAR_VEL: f32 = 0.6;
+const BAR_ANGULAR_VEL: f32 = 2.6;
 
 /// Per-substep push factor for the static obstacle (and the mouse cursor).
 pub const OBSTACLE_PUSH: f32 = 0.1;
@@ -101,6 +109,38 @@ pub fn build(scene: ObstacleScene, time: f32) -> Vec<Obstacle> {
                 half_extents: vec2(280.0, 20.0),
             }]
         }
+        ObstacleScene::RotatingCrosses => {
+            // 5 crosses: one centre + 4 corners of an inner square.
+            let offset = 280.0;
+            let centers = [
+                vec2(cx, cy),
+                vec2(cx - offset, cy - offset),
+                vec2(cx + offset, cy - offset),
+                vec2(cx - offset, cy + offset),
+                vec2(cx + offset, cy + offset),
+            ];
+            // Phases stagger the rotation so the crosses don't spin in
+            // lockstep. Constant array → bit-deterministic across runs.
+            let phases = [0.0, 0.7, 1.4, 2.1, 2.8];
+            let arm_half = vec2(80.0, 6.0);
+            let mut out = Vec::with_capacity(centers.len() * 2);
+            for (c, &phase) in centers.iter().zip(phases.iter()) {
+                let ang = time * BAR_ANGULAR_VEL + phase;
+                let axis = vec2(ang.cos(), ang.sin());
+                let perp = vec2(-axis.y, axis.x);
+                out.push(Obstacle::Rect {
+                    center: *c,
+                    axis,
+                    half_extents: arm_half,
+                });
+                out.push(Obstacle::Rect {
+                    center: *c,
+                    axis: perp,
+                    half_extents: arm_half,
+                });
+            }
+            out
+        }
         ObstacleScene::Ring => {
             let n = 12;
             let radius_ring = 220.0;
@@ -128,13 +168,103 @@ pub fn build(scene: ObstacleScene, time: f32) -> Vec<Obstacle> {
                 radius: 110.0,
             },
         ],
+        ObstacleScene::Cascade => {
+            // Multi-stage cascade. Particles drop from the top, hit a
+            // splitter, are funnelled inward, get whipped sideways by a
+            // rotating paddle, cushioned by flanking circles, narrowed
+            // again, hit a second (counter-rotating) paddle, then bounce
+            // off a final big disc near the floor.
+            let mut out = Vec::with_capacity(11);
+
+            // Stage 1: splitter circle, just under the spawn line.
+            out.push(Obstacle::Circle {
+                center: vec2(cx, 220.0),
+                radius: 55.0,
+            });
+
+            // Stage 2: V-funnel made of two static angled rects. Each arm
+            // is tilted ~25° toward the centre so particles slide inward.
+            let arm_angle: f32 = 0.45;
+            let arm_axis_l = vec2(arm_angle.cos(), arm_angle.sin());
+            let arm_axis_r = vec2(arm_angle.cos(), -arm_angle.sin());
+            let arm_half = vec2(150.0, 10.0);
+            out.push(Obstacle::Rect {
+                center: vec2(cx - 200.0, 360.0),
+                axis: arm_axis_l,
+                half_extents: arm_half,
+            });
+            out.push(Obstacle::Rect {
+                center: vec2(cx + 200.0, 360.0),
+                axis: arm_axis_r,
+                half_extents: arm_half,
+            });
+
+            // Stage 3: rotating paddle in the middle. Slower than the
+            // historical RotatingBar so particles can interact properly.
+            let ang1 = time * (BAR_ANGULAR_VEL * 0.7);
+            out.push(Obstacle::Rect {
+                center: vec2(cx, 520.0),
+                axis: vec2(ang1.cos(), ang1.sin()),
+                half_extents: vec2(170.0, 14.0),
+            });
+
+            // Stage 4: flanking circles that catch particles thrown
+            // outward by the paddle and redirect them back inward.
+            out.push(Obstacle::Circle {
+                center: vec2(cx - 320.0, 660.0),
+                radius: 60.0,
+            });
+            out.push(Obstacle::Circle {
+                center: vec2(cx + 320.0, 660.0),
+                radius: 60.0,
+            });
+
+            // Stage 5: chevron of two angled rects that narrow the flow
+            // again toward the centre, this time pointing slightly
+            // outward at the top so they form an inverted-V mouth.
+            let chev_angle: f32 = -0.45;
+            let chev_axis_l = vec2(chev_angle.cos(), chev_angle.sin());
+            let chev_axis_r = vec2(chev_angle.cos(), -chev_angle.sin());
+            let chev_half = vec2(140.0, 10.0);
+            out.push(Obstacle::Rect {
+                center: vec2(cx - 180.0, 800.0),
+                axis: chev_axis_l,
+                half_extents: chev_half,
+            });
+            out.push(Obstacle::Rect {
+                center: vec2(cx + 180.0, 800.0),
+                axis: chev_axis_r,
+                half_extents: chev_half,
+            });
+
+            // Stage 6: second rotating paddle, counter-rotating against
+            // the first (negative angular velocity, slight phase) for
+            // visual contrast.
+            let ang2 = -time * (BAR_ANGULAR_VEL * 0.55) + 0.9;
+            out.push(Obstacle::Rect {
+                center: vec2(cx, 940.0),
+                axis: vec2(ang2.cos(), ang2.sin()),
+                half_extents: vec2(160.0, 14.0),
+            });
+
+            // Stage 7: final big deflector near the bottom.
+            out.push(Obstacle::Circle {
+                center: vec2(cx, 1080.0),
+                radius: 75.0,
+            });
+
+            out
+        }
     }
 }
 
 /// Whether a scene needs its obstacle list rebuilt every step (rotating
 /// bars, swept colliders) or whether the layout is static.
 pub fn scene_is_animated(scene: ObstacleScene) -> bool {
-    matches!(scene, ObstacleScene::RotatingBar)
+    matches!(
+        scene,
+        ObstacleScene::RotatingBar | ObstacleScene::RotatingCrosses | ObstacleScene::Cascade
+    )
 }
 
 /// World-space axis-aligned bounding box for an obstacle, expanded by `pad`.

@@ -44,10 +44,10 @@ pub fn print_breakdown(frames: usize) {
     );
 }
 
-pub const MAX_PARTICLES: usize = 70000;
-pub(crate) const MAX_RADIUS: f32 = 2.5;
-pub const NB_THREAD: usize = 8;
-pub(crate) const BIN_SIZE: usize = 5;
+pub const MAX_PARTICLES: usize = 200000;
+pub(crate) const MAX_RADIUS: f32 = 2.0;
+pub const NB_THREAD: usize = 12;
+pub(crate) const BIN_SIZE: usize = 4;
 pub const BIN_W: usize = WIDTH / BIN_SIZE;
 pub(crate) const BIN_H: usize = HEIGHT / BIN_SIZE;
 pub(crate) const NUM_BIN: usize = BIN_W * BIN_H;
@@ -57,9 +57,11 @@ pub(crate) const NUM_BIN: usize = BIN_W * BIN_H;
 /// renderer hides this buffer by zooming the camera to the playable area.
 pub const BORDER_PADDING: f32 = 15.0;
 
-/// Gravity acceleration in world units / s². Small X gives the flow a slight
-/// horizontal drift; Y dominates.
-const GRAVITY: Vec2 = Vec2::new(10.0, 200.0);
+/// Gravity acceleration in world units / s². Pure downward — any non-zero X
+/// component shows up as a steady rightward (or leftward) drift that becomes
+/// dominant once the floor saturates and particles can no longer dissipate
+/// the lateral velocity through stacking gaps.
+const GRAVITY: Vec2 = Vec2::new(0.0, 200.0);
 /// Pushback factor for wall constraints. <1 leaves a residual overlap for the
 /// next substep to clean up — softer visuals, more stable.
 const WALL_DAMPING: f32 = 0.75;
@@ -93,6 +95,12 @@ pub struct Physics {
     pos: Vec<Vec3>,
     last_pos: Vec<Vec2>,
     sorted_pos: Vec<SortedSlot>,
+    /// Per-slot delta accumulator for Jacobi-style pair resolution. During
+    /// `check_collisions` we read positions from `sorted_pos` and write
+    /// deltas here, then add them back at the end. This decouples the
+    /// solver from update ordering, killing the rightward Gauss-Seidel
+    /// drift that's otherwise visible at saturation density.
+    delta_buf: Vec<Vec2>,
     /// View of `sorted_pos` as `Vec<Bin>`, rebuilt lazily on demand for the UI.
     bins: Vec<Bin>,
     bins_dirty: bool,
@@ -121,6 +129,12 @@ pub struct Physics {
     sim_time: f32,
     /// Number of `emit_flow` calls so far. Drives the pulse/burst emitters.
     emit_count: u32,
+    /// Toggle for the collision-sweep direction. Iterative position-based
+    /// pair resolution biases material toward the sweep direction (a
+    /// well-known Gauss-Seidel artifact). Flipping each step cancels the
+    /// drift over even step counts. Bit-deterministic since the toggle is
+    /// part of `Physics` state.
+    sweep_dir: bool,
 }
 
 impl Physics {
@@ -147,6 +161,7 @@ impl Physics {
             pos: vec![Vec3::ZERO; MAX_PARTICLES],
             last_pos: vec![Vec2::ZERO; MAX_PARTICLES],
             sorted_pos: vec![(Vec3::ZERO, 0u32); MAX_PARTICLES],
+            delta_buf: vec![Vec2::ZERO; MAX_PARTICLES],
             bins,
             bins_dirty: true,
             bin_start: vec![0; NUM_BIN + 1],
@@ -158,6 +173,7 @@ impl Physics {
             obstacle_bins,
             sim_time: 0.0,
             emit_count: 0,
+            sweep_dir: true,
         }
     }
 
@@ -293,16 +309,31 @@ impl Physics {
             *slot = unsafe { *self.bin_start.get_unchecked(k * chunk_size) };
         }
 
+        // Jacobi-style pair resolution: zero the delta accumulator, then run
+        // the parallel pair pass writing to `delta_buf` while reading
+        // immutably from `sorted_pos`. The same slot can have its delta
+        // accumulated by multiple bin iterations in this single pass — but
+        // never by two threads, since the strip carving is identical for
+        // both buffers. After the pass, fold deltas back into sorted_pos.
+        // This decouples the solver from update ordering, killing the
+        // rightward Gauss-Seidel drift visible at saturation density.
+        for d in &mut self.delta_buf[..self.len] {
+            *d = Vec2::ZERO;
+        }
+
         // SAFETY (for the `get_unchecked` reads/writes below):
         // - `bin_start` has length `NUM_BIN + 1`, and every `bin_start[k]`
         //   access uses `k < NUM_BIN + 1`. The maximum we touch is
         //   `bin_start[col_b + 2]` where `col_b = bin1 + BIN_H` and
         //   `bin1 < NUM_BIN - 1`, so `col_b + 2 <= NUM_BIN + 1`.
-        // - `slice_pos` covers exactly the contiguous bins assigned to this
-        //   strip, with `offset = bin_start[first bin in strip]`. Every i
-        //   we index into it (`i1`, `i2`) comes from `bin_start[bin]` for a
-        //   bin in this strip's range, so `offset <= i < offset + slice_pos.len()`.
-        let check_slice = |slice_pos: &mut [SortedSlot],
+        // - `slice_pos`/`slice_delta` cover exactly the contiguous bins
+        //   assigned to this strip, with `offset = bin_start[first bin]`.
+        //   Every i we index into them (`i1`, `i2`) comes from
+        //   `bin_start[bin]` for a bin in this strip's range, so
+        //   `offset <= i < offset + slice_pos.len()`.
+        let sweep_dir = self.sweep_dir;
+        let check_slice = |slice_pos: &[SortedSlot],
+                           slice_delta: &mut [Vec2],
                            offset: usize,
                            start_x: usize,
                            width: usize,
@@ -310,10 +341,45 @@ impl Physics {
             if slice_pos.is_empty() {
                 return;
             }
+            debug_assert_eq!(slice_pos.len(), slice_delta.len());
             let bin_start = self.bin_start.as_slice();
-            for bin_x in (start_x + wall)..((start_x + width) - wall) {
+            // Outer-loop direction toggles per step. Each iteration of the
+            // pair resolution still visits the same set of unordered pairs
+            // (the inner "forward neighbours only" structure below
+            // guarantees that). Only the *order* in which Gauss-Seidel
+            // updates are applied changes, which is exactly what cancels
+            // the rightward/downward bias over even step counts.
+            //
+            // We materialise the bin index lists into `[usize; N]` arrays
+            // so the inner loop body is identical in both directions, and
+            // the only allocation is the two stack arrays sized to the
+            // strip width / column height (small, fixed by const config).
+            let x_lo = start_x + wall;
+            let x_hi = (start_x + width) - wall;
+            let y_lo = 1usize;
+            let y_hi = BIN_H - 1;
+            let mut x_indices: [usize; BIN_W] = [0; BIN_W];
+            let mut y_indices: [usize; BIN_H] = [0; BIN_H];
+            let nx = x_hi - x_lo;
+            let ny = y_hi - y_lo;
+            if sweep_dir {
+                for (k, v) in (x_lo..x_hi).enumerate() {
+                    x_indices[k] = v;
+                }
+                for (k, v) in (y_lo..y_hi).enumerate() {
+                    y_indices[k] = v;
+                }
+            } else {
+                for (k, v) in (x_lo..x_hi).rev().enumerate() {
+                    x_indices[k] = v;
+                }
+                for (k, v) in (y_lo..y_hi).rev().enumerate() {
+                    y_indices[k] = v;
+                }
+            }
+            for &bin_x in &x_indices[..nx] {
                 let col_base = bin_x * BIN_H;
-                for bin_y in 1..BIN_H - 1 {
+                for &bin_y in &y_indices[..ny] {
                     let bin1 = col_base + bin_y;
                     // SAFETY: bin1+1 <= NUM_BIN (bin1 < NUM_BIN-1 because bin_y < BIN_H-1).
                     let i1_lo = unsafe { *bin_start.get_unchecked(bin1) };
@@ -346,9 +412,13 @@ impl Physics {
                         debug_assert!(i1 >= offset && i1 - offset < slice_pos.len());
                         let (pos1, _) = unsafe { *slice_pos.get_unchecked(i1 - offset) };
                         let pos1_z = pos1.z;
-                        // Accumulate locally and write i1 back once: i1 is never read
-                        // as i2 within this iteration (same-bin uses i2 > i1, fwd is
-                        // a different bin), so we can defer the RMW.
+                        // Jacobi: accumulate i1's delta locally; fold it into
+                        // the shared `slice_delta` once at the end of this i1
+                        // iteration. i2's delta is also written to
+                        // `slice_delta`, never to `slice_pos` — the input
+                        // positions stay frozen for the entire pass, which
+                        // kills the rightward Gauss-Seidel drift visible at
+                        // saturation density.
                         let mut delta1 = Vec2::ZERO;
 
                         // Same-bin: start at i1+1 so i2 > i1 is guaranteed, no predicate.
@@ -367,9 +437,8 @@ impl Physics {
                                 let v_scaled = v * dn;
                                 delta1 -= v_scaled * pos2.z;
                                 let i2_delta = v_scaled * pos1_z;
-                                let slot = unsafe { slice_pos.get_unchecked_mut(i2 - offset) };
-                                slot.0.x += i2_delta.x;
-                                slot.0.y += i2_delta.y;
+                                let slot = unsafe { slice_delta.get_unchecked_mut(i2 - offset) };
+                                *slot += i2_delta;
                             }
                         }
 
@@ -387,28 +456,30 @@ impl Physics {
                                     let v_scaled = v * dn;
                                     delta1 -= v_scaled * pos2.z;
                                     let i2_delta = v_scaled * pos1_z;
-                                    let slot = unsafe { slice_pos.get_unchecked_mut(i2 - offset) };
-                                    slot.0.x += i2_delta.x;
-                                    slot.0.y += i2_delta.y;
+                                    let slot =
+                                        unsafe { slice_delta.get_unchecked_mut(i2 - offset) };
+                                    *slot += i2_delta;
                                 }
                             }
                         }
 
                         if delta1 != Vec2::ZERO {
-                            let slot = unsafe { slice_pos.get_unchecked_mut(i1 - offset) };
-                            slot.0.x += delta1.x;
-                            slot.0.y += delta1.y;
+                            let slot = unsafe { slice_delta.get_unchecked_mut(i1 - offset) };
+                            *slot += delta1;
                         }
                     }
                 }
             }
         };
 
-        // Carve `sorted_pos` into NB_THREAD disjoint &mut sub-slices, one per
-        // column-strip. Chained `split_at_mut` lets Rayon process them in
-        // parallel without a Mutex.
-        let mut main_subs: Vec<(&mut [SortedSlot], usize, usize)> = Vec::with_capacity(NB_THREAD);
-        let mut rest: &mut [SortedSlot] = &mut self.sorted_pos[..];
+        // Carve both `sorted_pos` (read-only) and `delta_buf` (write-only)
+        // into NB_THREAD disjoint sub-slices using identical breakpoints.
+        // The two carvings stay in lock-step since the layouts are tied to
+        // `bin_start`. Rayon processes the strips in parallel without a Mutex.
+        let sorted_pos: &[SortedSlot] = &self.sorted_pos[..];
+        let mut main_subs: Vec<(&[SortedSlot], &mut [Vec2], usize, usize)> =
+            Vec::with_capacity(NB_THREAD);
+        let mut delta_rest: &mut [Vec2] = &mut self.delta_buf[..];
         for slice_i in 0..NB_THREAD {
             let a = breakpoints_thread[slice_i];
             let b = if slice_i + 1 < NB_THREAD {
@@ -416,23 +487,24 @@ impl Physics {
             } else {
                 self.len
             };
-            let skip = a - main_subs.last().map(|s| s.1 + s.0.len()).unwrap_or(0);
-            let (_, after) = rest.split_at_mut(skip);
-            let (sub, tail) = after.split_at_mut(b - a);
-            main_subs.push((sub, a, slice_i * thread_width));
-            rest = tail;
+            let skip = a - main_subs.last().map(|s| s.2 + s.0.len()).unwrap_or(0);
+            let (_, dafter) = delta_rest.split_at_mut(skip);
+            let (dsub, dtail) = dafter.split_at_mut(b - a);
+            let psub: &[SortedSlot] = &sorted_pos[a..b];
+            main_subs.push((psub, dsub, a, slice_i * thread_width));
+            delta_rest = dtail;
         }
         main_subs
             .into_par_iter()
-            .for_each(|(slice_pos, offset, start_x)| {
-                check_slice(slice_pos, offset, start_x, thread_width, 1);
+            .for_each(|(slice_pos, slice_delta, offset, start_x)| {
+                check_slice(slice_pos, slice_delta, offset, start_x, thread_width, 1);
             });
 
         // Border pass: each strip processes the 2-column seam (start_x, start_x+1)
         // between two main-pass slices, needing 3×3 neighbours so the bin range is
         // [(start_x-1)*BIN_H, (start_x+3)*BIN_H). Adjacent border strips are spaced
         // `thread_width` columns apart (10 > 4 here), so they never overlap and we
-        // can carve disjoint &mut sub-slices for parallel processing.
+        // can carve disjoint sub-slices for parallel processing.
         let mut strips: Vec<(usize, usize, usize)> = Vec::with_capacity(NB_THREAD - 1);
         for slice_i in 0..(NB_THREAD - 1) {
             let start_x = (slice_i + 1) * thread_width - 1;
@@ -447,26 +519,35 @@ impl Physics {
                 strips.push((a, b, start_x));
             }
         }
-        // Strips are in increasing a-order; carve out non-overlapping &mut sub-slices.
-        let mut rest: &mut [SortedSlot] = &mut self.sorted_pos[..];
+        // Strips are in increasing a-order; carve out non-overlapping sub-slices.
+        let mut delta_rest: &mut [Vec2] = &mut self.delta_buf[..];
         let mut rest_off: usize = 0;
-        let mut sub_slices: Vec<(&mut [SortedSlot], usize, usize)> =
+        let mut sub_slices: Vec<(&[SortedSlot], &mut [Vec2], usize, usize)> =
             Vec::with_capacity(strips.len());
         for &(a, b, start_x) in &strips {
             let skip = a - rest_off;
-            let (_, after) = rest.split_at_mut(skip);
-            let (sub, tail) = after.split_at_mut(b - a);
-            sub_slices.push((sub, a, start_x));
-            rest = tail;
+            let (_, dafter) = delta_rest.split_at_mut(skip);
+            let (dsub, dtail) = dafter.split_at_mut(b - a);
+            let psub: &[SortedSlot] = &sorted_pos[a..b];
+            sub_slices.push((psub, dsub, a, start_x));
+            delta_rest = dtail;
             rest_off = b;
         }
         sub_slices
             .into_par_iter()
-            .for_each(|(slice, offset, start_x)| {
-                check_slice(slice, offset, start_x, 2, 0);
+            .for_each(|(slice_pos, slice_delta, offset, start_x)| {
+                check_slice(slice_pos, slice_delta, offset, start_x, 2, 0);
             });
 
-        for sp in self.sorted_pos.iter().take(self.len) {
+        // Fold deltas back into sorted_pos and update pos by particle id.
+        for (sp, &d) in self
+            .sorted_pos
+            .iter_mut()
+            .zip(self.delta_buf.iter())
+            .take(self.len)
+        {
+            sp.0.x += d.x;
+            sp.0.y += d.y;
             self.pos[sp.1 as usize] = sp.0;
         }
     }
@@ -485,6 +566,8 @@ impl Physics {
         let t = Instant::now();
         self.check_collisions();
         T_CHECK_COLLISIONS.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+
+        self.sweep_dir = !self.sweep_dir;
     }
 
     /// Soft repel against an external collider (mouse cursor). Mirrors the
@@ -553,6 +636,12 @@ impl Physics {
     /// up to `len` is meaningful.
     pub fn active_points(&self) -> &[Vec3] {
         &self.pos[..self.len]
+    }
+
+    /// Previous-step position slice (Verlet `last_pos`). Useful for
+    /// diagnostics that want per-particle velocity = `pos.xy() - last_pos`.
+    pub fn active_last_pos(&self) -> &[Vec2] {
+        &self.last_pos[..self.len]
     }
 
     /// Renderable circle list (centre.xy, radius) for the active obstacle

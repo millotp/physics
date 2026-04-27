@@ -301,6 +301,20 @@ impl Stage {
 }
 
 /// Build the unit-circle fan geometry + index buffer used by every disc draw.
+/// Map a cursor position from miniquad's mouse-event coordinate space to
+/// simulation world units. With `high_dpi: true`, miniquad delivers cursor
+/// coordinates in *physical pixels* (logical points × `dpi_scale`), so we
+/// undo that scale before mapping into the playable area inside
+/// `BORDER_PADDING`.
+fn screen_to_world(x: f32, y: f32) -> Vec2 {
+    let dpi = window::dpi_scale().max(1.0);
+    let lx = x / dpi;
+    let ly = y / dpi;
+    let scale_x = (WIDTH as f32 - 2.0 * BORDER_PADDING) / WINDOW_SIZE as f32;
+    let scale_y = (HEIGHT as f32 - 2.0 * BORDER_PADDING) / WINDOW_SIZE as f32;
+    vec2(BORDER_PADDING + lx * scale_x, BORDER_PADDING + ly * scale_y)
+}
+
 /// `sides` controls tessellation; the same fan is instanced per particle or
 /// per obstacle, scaled by `pos_radius.z` in the vertex shader.
 fn make_circle_geometry(ctx: &mut dyn RenderingBackend, sides: usize) -> (BufferId, BufferId) {
@@ -350,7 +364,11 @@ impl EventHandler for Stage {
         }
 
         if self.mouse_pressed {
-            self.physics.avoid_obstacle(self.mouse_pos, 50.0);
+            // 50 logical points, scaled to world units so the cursor's
+            // visual influence matches the rendered size.
+            let radius_world =
+                50.0 * (WIDTH as f32 - 2.0 * BORDER_PADDING) / WINDOW_SIZE as f32;
+            self.physics.avoid_obstacle(self.mouse_pos, radius_world);
         }
 
         self.frame_count += 1;
@@ -373,13 +391,13 @@ impl EventHandler for Stage {
 
     fn mouse_motion_event(&mut self, x: f32, y: f32) {
         if self.mouse_pressed {
-            self.mouse_pos = vec2(x, y);
+            self.mouse_pos = screen_to_world(x, y);
         }
     }
 
     fn mouse_button_down_event(&mut self, button: MouseButton, x: f32, y: f32) {
         if button == MouseButton::Left {
-            self.mouse_pos = vec2(x, y);
+            self.mouse_pos = screen_to_world(x, y);
             self.mouse_pressed = true;
         }
     }
@@ -598,6 +616,10 @@ fn main() {
         run_gui_sig(&args);
         return;
     }
+    if args.iter().any(|a| a == "--drift") {
+        run_drift(&args);
+        return;
+    }
     miniquad::start(
         conf::Conf {
             // The window is in screen points, decoupled from `WIDTH`/`HEIGHT`
@@ -706,6 +728,66 @@ fn run_bench(args: &[String]) {
 /// Headless replay of the GUI's `update()` body. Identical control flow,
 /// no rendering or input. Prints a position signature so determinism can
 /// be asserted byte-perfectly across runs of the same scene.
+/// Diagnostic for the lateral drift bug at high particle density. Spawns
+/// particles deterministically, periodically prints the centre-of-mass x
+/// of the bottom 10% of particles relative to world centre `WIDTH/2`. A
+/// sustained increase = rightward drift, a decrease = leftward drift,
+/// noise around zero = no drift.
+fn run_drift(args: &[String]) {
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).skip(1).collect();
+    let parse_or = |s: Option<&&String>, default: u64| -> u64 {
+        s.and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let frames: u64 = parse_or(positional.first(), 6000);
+    let seed: u64 = parse_or(positional.get(1), 1);
+    let print_every: u64 = parse_or(positional.get(2), 200);
+
+    quad_rand::srand(seed);
+    let mut physics = Physics::new();
+    let dt: f32 = 1.0 / 120.0;
+    let cx = WIDTH as f32 * 0.5;
+    println!("drift seed={} world_cx={:.1} (positive cm_dx = rightward drift)", seed, cx);
+    for f in 0..frames {
+        physics.emit_flow_for(dt);
+        for _ in 0..5 {
+            physics.step(dt / 5.0);
+        }
+        if (f + 1) % print_every == 0 {
+            let pts = physics.active_points();
+            let last = physics.active_last_pos();
+            if pts.is_empty() {
+                continue;
+            }
+            let mut ys: Vec<f32> = pts.iter().map(|p| p.y).collect();
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let cutoff_idx = (ys.len() as f32 * 0.9) as usize;
+            let cutoff_y = ys[cutoff_idx.min(ys.len() - 1)];
+            let mut sum_x = 0.0f64;
+            let mut sum_vx = 0.0f64;
+            let mut count = 0u64;
+            for (p, lp) in pts.iter().zip(last.iter()) {
+                if p.y >= cutoff_y {
+                    sum_x += p.x as f64;
+                    sum_vx += (p.x - lp.x) as f64;
+                    count += 1;
+                }
+            }
+            let cm_x = if count > 0 { sum_x / count as f64 } else { 0.0 };
+            let cm_vx = if count > 0 { sum_vx / count as f64 } else { 0.0 };
+            let dx = cm_x - cx as f64;
+            println!(
+                "frame={:>5} n={:>6} bot_n={:>5} cm_x={:>9.3} cm_dx={:+8.3} mean_vx={:+8.5}",
+                f + 1,
+                pts.len(),
+                count,
+                cm_x,
+                dx,
+                cm_vx
+            );
+        }
+    }
+}
+
 fn run_gui_sig(args: &[String]) {
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).skip(1).collect();
     let parse_or = |s: Option<&&String>, default: u64| -> u64 {
